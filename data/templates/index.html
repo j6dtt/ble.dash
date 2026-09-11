@@ -1,0 +1,558 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BLE Track Viewer</title>
+<link rel="stylesheet" href="/static/leaflet/leaflet.css"/>
+<script src="/static/leaflet/leaflet.js"></script>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { height: 100%; font-family: 'Segoe UI', sans-serif; background: #0d1117; color: #c9d1d9; }
+
+#topbar {
+  height: 46px; background: #161b22; border-bottom: 1px solid #30363d;
+  display: flex; align-items: center; padding: 0 16px; gap: 12px;
+}
+#topbar h1 { font-size: 1rem; font-weight: 600; color: #58a6ff; letter-spacing: .5px; }
+#live-wrap { margin-left: auto; display: flex; align-items: center; gap: 6px; font-size: .75rem; color: #8b949e; }
+#live-dot { width: 9px; height: 9px; border-radius: 50%; background: #30363d; transition: background .4s; }
+#live-dot.on { background: #3fb950; box-shadow: 0 0 6px #3fb950; }
+
+#main { display: flex; height: calc(100vh - 46px); }
+#map  { flex: 1; position: relative; }
+
+/* Attribution moved to top-right, away from the detail bar */
+.leaflet-bottom.leaflet-right { bottom: auto; top: 0; }
+
+/* ── Detail bar (shown only while a device is drilled into) ───────── */
+#detailbar {
+  position: absolute; bottom: 0; left: 0; right: 0; z-index: 800;
+  display: none; align-items: center; gap: 10px;
+  background: rgba(22,27,34,0.93); backdrop-filter: blur(4px);
+  padding: 9px 14px; border-top: 1px solid #30363d;
+}
+#detail-name { font-size: .78rem; font-weight: 700; color: #58a6ff; letter-spacing: .3px; }
+#detail-archive {
+  margin-left: auto; flex-shrink: 0; height: 28px; padding: 0 10px;
+  border-radius: 4px; background: #21262d; border: 1px solid #30363d;
+  color: #c9d1d9; font-size: .75rem; cursor: pointer; white-space: nowrap;
+}
+#detail-archive:hover { background: #2b2000; border-color: #e3b341; color: #e3b341; }
+#detail-back {
+  flex-shrink: 0; height: 28px; padding: 0 10px;
+  border-radius: 4px; background: #21262d; border: 1px solid #30363d;
+  color: #c9d1d9; font-size: .75rem; cursor: pointer; white-space: nowrap;
+}
+#detail-back:hover { background: #30363d; border-color: #58a6ff; color: #58a6ff; }
+
+/* ── Device panel ─────────────────────────────────── */
+#panel {
+  width: 270px; background: #161b22; border-left: 1px solid #30363d;
+  display: flex; flex-direction: column; overflow: hidden;
+}
+#panel-header {
+  padding: 10px 14px; border-bottom: 1px solid #30363d;
+  font-size: .7rem; text-transform: uppercase; letter-spacing: 1px; color: #8b949e;
+  display: flex; justify-content: space-between; align-items: center; gap: 8px;
+}
+#panel-header-left { display: flex; align-items: center; gap: 8px; }
+#archived-toggle {
+  font-size: .65rem; text-transform: none; letter-spacing: normal;
+  padding: 2px 8px; border-radius: 10px; white-space: nowrap;
+  background: #21262d; border: 1px solid #30363d; color: #8b949e; cursor: pointer;
+}
+#archived-toggle:hover  { border-color: #58a6ff; color: #58a6ff; }
+#archived-toggle.active { border-color: #e3b341; color: #e3b341; background: #2b2000; }
+#device-count { background: #21262d; padding: 1px 7px; border-radius: 10px; color: #c9d1d9; font-size: .75rem; flex-shrink: 0; }
+#device-list  { flex: 1; overflow-y: auto; padding: 8px; }
+#empty { color: #8b949e; font-size: .82rem; text-align: center; padding: 24px 0; }
+
+.card {
+  background: #21262d; border: 1px solid #30363d; border-radius: 6px;
+  padding: 10px 12px; margin-bottom: 6px; transition: border-color .2s;
+  cursor: pointer;
+}
+.card:hover  { border-color: #58a6ff; }
+.card.active { border-color: #58a6ff; }
+.card-name  { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: .9rem; }
+.dot        { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+.card-archive {
+  margin-left: auto; flex-shrink: 0; width: 22px; height: 22px;
+  background: none; border: 1px solid #30363d; border-radius: 3px;
+  color: #8b949e; font-size: .7rem; cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+}
+.card-archive:hover { border-color: #e3b341; color: #e3b341; }
+.card-uuid  { font-size: .65rem; color: #8b949e; font-family: monospace; margin-top: 3px; }
+.card-stats { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 7px; font-size: .72rem; color: #8b949e; }
+.stat-val   { color: #c9d1d9; font-weight: 600; }
+.sparkline  { display: block; margin-top: 8px; overflow: visible; }
+
+/* ── Log entries (shown in the panel while a device is drilled into) ── */
+.log-row {
+  background: #21262d; border: 1px solid #30363d; border-radius: 6px;
+  padding: 8px 10px; margin-bottom: 4px; cursor: pointer; transition: border-color .2s;
+}
+.log-row:hover  { border-color: #58a6ff; }
+.log-row.active { border-color: #e3b341; background: #2b2000; }
+.log-time { font-family: monospace; font-size: .74rem; color: #c9d1d9; }
+.log-meta { display: flex; flex-wrap: wrap; gap: 5px 12px; margin-top: 4px; font-size: .68rem; color: #8b949e; }
+
+/* ── Leaflet overrides ───────────────────────────── */
+.leaflet-control-resetview a {
+  display: flex; align-items: center; justify-content: center;
+  width: 30px; height: 30px; background: #fff; border-radius: 4px;
+  text-decoration: none; color: #333;
+}
+.leaflet-control-resetview a:hover { background: #f4f4f4; }
+.leaflet-popup-content-wrapper {
+  background: #161b22; color: #c9d1d9;
+  border: 1px solid #30363d; border-radius: 8px; box-shadow: 0 4px 16px rgba(0,0,0,.5);
+}
+.leaflet-popup-tip          { background: #161b22; }
+.leaflet-popup-close-button { color: #8b949e !important; font-size: 1rem !important; }
+.leaflet-popup-close-button:hover { color: #c9d1d9 !important; }
+.popup-name  { font-size: .9rem; font-weight: 700; color: #58a6ff; margin-bottom: 10px; }
+.popup-row   { display: flex; justify-content: space-between; gap: 16px; padding: 4px 0; border-bottom: 1px solid #21262d; font-size: .75rem; }
+.popup-row:last-child { border-bottom: none; }
+.popup-label { color: #8b949e; white-space: nowrap; }
+.popup-val   { color: #c9d1d9; font-family: monospace; text-align: right; }
+.crumb-tip   {
+  background: #161b22; color: #c9d1d9; border: 1px solid #30363d;
+  border-radius: 4px; font-size: .7rem; padding: 2px 6px; box-shadow: none;
+}
+.crumb-tip::before { display: none; }
+
+@keyframes pulse {
+  0%,100% { opacity: 1; transform: scale(1);    box-shadow: 0 0 4px 1px var(--c); }
+  50%      { opacity: 0.4; transform: scale(1.6); box-shadow: 0 0 10px 4px var(--c); }
+}
+.crumb-latest { animation: pulse 0.8s ease-in-out infinite; border-radius: 50%; }
+</style>
+</head>
+<body>
+
+<div id="topbar">
+  <h1>BLE Track Viewer</h1>
+  <div id="live-wrap">
+    <div id="live-dot"></div>
+    <span id="live-label">connecting…</span>
+  </div>
+</div>
+
+<div id="main">
+  <div id="map">
+    <div id="detailbar">
+      <span id="detail-name"></span>
+      <button id="detail-archive" onclick="archiveSelected()" title="Archive this device">🗄 Archive</button>
+      <button id="detail-back" onclick="exitDetail()">← Back to overview</button>
+    </div>
+  </div>
+  <div id="panel">
+    <div id="panel-header">
+      <div id="panel-header-left">
+        <span id="panel-title">Devices</span>
+        <button id="archived-toggle" onclick="toggleArchivedView()" title="View archived devices">Archived</button>
+      </div>
+      <span id="device-count">0</span>
+    </div>
+    <div id="device-list"><div id="empty">No data received yet</div></div>
+  </div>
+</div>
+
+<script>
+// ── Leaflet icon fix ──────────────────────────────────────────────
+delete L.Icon.Default.prototype._getIconUrl;
+L.Icon.Default.mergeOptions({
+  iconUrl:       '/static/leaflet/images/marker-icon.png',
+  iconRetinaUrl: '/static/leaflet/images/marker-icon-2x.png',
+  shadowUrl:     '/static/leaflet/images/marker-shadow.png',
+});
+
+// ── Map ───────────────────────────────────────────────────────────
+const map = L.map('map').setView([33.30, 44.39], 14);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+  maxZoom: 19, subdomains: 'abc'
+}).addTo(map);
+
+L.Control.ResetView = L.Control.extend({
+  options: { position: 'topleft' },
+  onAdd() {
+    const div = L.DomUtil.create('div', 'leaflet-bar leaflet-control-resetview');
+    const a   = L.DomUtil.create('a', '', div);
+    a.title = 'Reset view'; a.href = '#';
+    a.innerHTML = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M3 12a9 9 0 1 0 18 0 9 9 0 0 0-18 0"/>
+      <path d="M12 8v4l3 3"/>
+      <line x1="12" y1="3" x2="12" y2="1"/><line x1="12" y1="23" x2="12" y2="21"/>
+      <line x1="3" y1="12" x2="1" y2="12"/><line x1="23" y1="12" x2="21" y2="12"/>
+    </svg>`;
+    L.DomEvent.on(a, 'click', e => { L.DomEvent.preventDefault(e); resetView(); });
+    return div;
+  }
+});
+new L.Control.ResetView().addTo(map);
+
+// ── State ─────────────────────────────────────────────────────────
+const COLORS = ['#2563eb','#16a34a','#dc2626','#9333ea','#ea580c','#0891b2','#65a30d','#be185d','#7c3aed','#b45309'];
+const colorMap = {};
+let colorIdx = 0;
+function getColor(uuid) {
+  if (!colorMap[uuid]) colorMap[uuid] = COLORS[colorIdx++ % COLORS.length];
+  return colorMap[uuid];
+}
+
+const layers  = {};
+let allTracks = [];
+let cachedDevices = [];
+
+// Drill-down: at most one device's full trail is ever shown at a time.
+// Overview (selectedDevice === null) shows only latest-position markers.
+let selectedDevice = null;
+let highlightedIdx = null;   // index into the selected device's points, or null
+
+// Archived devices are excluded from /api/tracks and /api/devices (and from
+// live SSE pushes) server-side — the panel's "Archived" view fetches them
+// separately with ?archived=1 and is mutually exclusive with drill-down.
+let showArchived = false;
+
+// ── Utilities ─────────────────────────────────────────────────────
+function tsToMs(ts) {
+  if (!ts) return null;
+  return new Date((ts.includes('T') ? ts : ts.replace(' ', 'T')) + 'Z').getTime();
+}
+function ago(ts) {
+  if (!ts) return '—';
+  let s = Math.floor((Date.now() - tsToMs(ts)) / 1000);
+  if (isNaN(s) || s < 0) return '—';
+  const d = Math.floor(s / 86400); s %= 86400;
+  const h = Math.floor(s / 3600);  s %= 3600;
+  const m = Math.floor(s / 60);    s %= 60;
+  if (d) return `${d}d ${h}h ${m}m`;
+  if (h) return `${h}h ${m}m ${s}s`;
+  if (m) return `${m}m ${s}s`;
+  return `${s}s`;
+}
+
+// ── Drill-down ────────────────────────────────────────────────────
+function selectDevice(uuid) {
+  const track = allTracks.find(t => t.uuid === uuid);
+  if (!track?.points?.length) return;
+
+  selectedDevice = uuid;
+  highlightedIdx = null;
+  renderTracks(allTracks);
+  renderPanel(null);
+
+  document.getElementById('detail-name').textContent = track.name;
+  document.getElementById('detailbar').style.display  = 'flex';
+  document.getElementById('archived-toggle').style.display = 'none';
+
+  if (track.points.length < 2) {
+    const p = track.points[0];
+    map.setView([p.lat, p.lon], 16, { animate: true });
+  } else {
+    const bounds = L.latLngBounds(track.points.map(p => [p.lat, p.lon]));
+    map.fitBounds(bounds.pad(0.25));
+  }
+}
+
+function exitDetail() {
+  selectedDevice = null;
+  highlightedIdx = null;
+  renderTracks(allTracks);
+  renderPanel(null);
+  document.getElementById('detailbar').style.display = 'none';
+  document.getElementById('archived-toggle').style.display = 'inline-block';
+}
+
+function archiveSelected() {
+  if (selectedDevice) archiveDevice(null, selectedDevice);
+}
+
+async function archiveDevice(evt, uuid) {
+  evt?.stopPropagation();
+  if (selectedDevice === uuid) exitDetail();
+  await fetch(`/api/devices/${uuid}/archive`, { method: 'POST' });
+  await loadAll();
+}
+
+async function unarchiveDevice(evt, uuid) {
+  evt?.stopPropagation();
+  await fetch(`/api/devices/${uuid}/unarchive`, { method: 'POST' });
+  showArchived = false;
+  document.getElementById('archived-toggle').classList.remove('active');
+  await loadAll();
+}
+
+async function toggleArchivedView() {
+  showArchived = !showArchived;
+  document.getElementById('archived-toggle').classList.toggle('active', showArchived);
+  if (showArchived) await renderArchived();
+  else renderPanel(cachedDevices);
+}
+
+// The archived list is fetched on demand (not kept live) — it's a
+// management view, not something that needs to track incoming fixes.
+async function renderArchived() {
+  const devices = await fetch('/api/devices?archived=1').then(r => r.json());
+
+  document.getElementById('panel-title').textContent = 'Archived';
+  document.getElementById('device-count').textContent = devices.length;
+
+  const list = document.getElementById('device-list');
+  if (!devices.length) { list.innerHTML = '<div id="empty">No archived devices</div>'; return; }
+
+  list.innerHTML = devices.map(d => {
+    const color = getColor(d.uuid);
+    return `<div class="card">
+      <div class="card-name">
+        <div class="dot" style="background:${color}"></div>
+        ${d.name}
+        <button class="card-archive" onclick="unarchiveDevice(event,'${d.uuid}')" title="Unarchive device">↩</button>
+      </div>
+      <div class="card-uuid">${d.uuid}</div>
+      <div class="card-stats">
+        <span><span class="stat-val">${d.fix_count}</span> fixes</span>
+        <span><span class="stat-val">${ago(d.last_seen)}</span></span>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+// Highlights one fix (from the log list or a sparkline dot): marks the crumb
+// on the map and re-renders the log so the matching row shows as active.
+function setHighlightedFix(idx) {
+  highlightedIdx = idx;
+  reapplyHighlight();
+  renderLog();
+}
+
+// Re-places the pulsing highlight marker over the current fix — called both
+// from setHighlightedFix() and after every renderTracks() (crumbs are rebuilt
+// on each render, so a live update would otherwise silently drop the
+// highlight). A separate overlay marker (rather than restyling the crumb
+// itself) so it pulses like the latest-position dot and is never buried
+// under the trail/line — Leaflet always draws markers above path overlays.
+let highlightMarker = null;
+
+function reapplyHighlight() {
+  if (highlightMarker) { highlightMarker.remove(); highlightMarker = null; }
+  if (!selectedDevice || highlightedIdx === null) return;
+
+  const track = allTracks.find(t => t.uuid === selectedDevice);
+  const pt = track?.points?.[highlightedIdx];
+  if (!pt) return;
+
+  highlightMarker = L.marker([pt.lat, pt.lon], { icon: markerIcon('#e3b341'), interactive: false }).addTo(map);
+}
+
+function highlightFix(idx) {
+  const track = allTracks.find(t => t.uuid === selectedDevice);
+  const pt = track?.points?.[idx];
+  if (!pt) return;
+  setHighlightedFix(idx);
+  map.panTo([pt.lat, pt.lon], { animate: true, duration: 0.4 });
+}
+
+// ── Map rendering ─────────────────────────────────────────────────
+function markerIcon(color) {
+  return L.divIcon({
+    html: `<div class="crumb-latest" style="width:20px;height:20px;background:${color};border:3px solid #fff;--c:${color}"></div>`,
+    className: '', iconSize: [20,20], iconAnchor: [10,10]
+  });
+}
+
+function popupHtml(name, uuid, pt) {
+  return `<div class="popup-name">${name}</div>` + [
+    ['UUID',       uuid],
+    ['Observed',   pt.timestamp   || '—'],
+    ['Ingested',   pt.ingest_time || '—'],
+    ['Lat / Lon',  `${pt.lat.toFixed(6)}, ${pt.lon.toFixed(6)}`],
+    ['Accuracy',   `±${pt.accuracy ?? '—'} m`],
+    ['Confidence', pt.confidence  ?? '—'],
+  ].map(([l,v]) => `<div class="popup-row"><span class="popup-label">${l}</span><span class="popup-val">${v}</span></div>`).join('');
+}
+
+function makeCrumbs(points, color) {
+  const n = points.length;
+  return points.map((p, i) => {
+    const t = n > 1 ? i / (n - 1) : 1;
+    return L.circleMarker([p.lat, p.lon], {
+      radius: 2.5 + 1.5 * t, color, fillColor: color,
+      fillOpacity: 0.12 + 0.55 * t, opacity: (0.12 + 0.55 * t) * 0.6, weight: 1
+    }).bindTooltip(p.timestamp || '—', { permanent: false, direction: 'top', className: 'crumb-tip' });
+  });
+}
+
+function renderTracks(tracks) {
+  for (const l of Object.values(layers)) {
+    l.crumbs?.forEach(c => c.remove());
+    l.path?.remove();
+    l.marker.remove();
+  }
+  for (const k of Object.keys(layers)) delete layers[k];
+
+  for (const { uuid, name, points } of tracks) {
+    if (!points.length) continue;
+    // While drilled into a device, only that device is shown at all.
+    if (selectedDevice && uuid !== selectedDevice) continue;
+
+    const color  = getColor(uuid);
+    const latest = points[points.length - 1];
+    const marker = L.marker([latest.lat, latest.lon], { icon: markerIcon(color) })
+      .addTo(map)
+      .bindPopup(popupHtml(name, uuid, latest), { offset: [0, -14], maxWidth: 260 })
+      .on('click', () => selectDevice(uuid));
+
+    const entry = { marker };
+
+    if (uuid === selectedDevice) {
+      // Drilled-in device: full breadcrumb trail + connecting line.
+      entry.crumbs = makeCrumbs(points, color).map(c => c.addTo(map));
+      entry.path   = L.polyline(points.map(p => [p.lat, p.lon]), { color, weight: 1, opacity: 0.3 }).addTo(map);
+    }
+
+    layers[uuid] = entry;
+  }
+
+  reapplyHighlight();
+}
+
+// ── Sparkline ─────────────────────────────────────────────────────
+function makeSparkline(uuid, color) {
+  const track = allTracks.find(t => t.uuid === uuid);
+  const pts   = (track?.points || []).filter(p => p.timestamp);
+  if (!pts.length) return '';
+
+  // Use this device's own time range for the sparkline axis
+  const ms   = pts.map(p => tsToMs(p.timestamp));
+  const tMin = Math.min(...ms), tMax = Math.max(...ms);
+  const span = tMax - tMin || 1;
+
+  const axis = `<line x1="4" y1="8" x2="196" y2="8" stroke="#30363d" stroke-width="1"/>`;
+  const dots = pts.map((p, i) => {
+    const x = (((ms[i] - tMin) / span) * 192 + 4).toFixed(1);
+    return `<circle cx="${x}" cy="8" r="3" fill="${color}" fill-opacity="0.75"
+      onclick="flyToFix(event,'${uuid}',${i})" style="cursor:pointer">
+      <title>${p.timestamp}</title></circle>`;
+  }).join('');
+
+  return `<svg class="sparkline" viewBox="0 0 200 16" preserveAspectRatio="none" width="100%" height="16">${axis}${dots}</svg>`;
+}
+
+// ── Panel ─────────────────────────────────────────────────────────
+function renderPanel(devices) {
+  if (devices) cachedDevices = devices;
+  else devices = cachedDevices;
+
+  if (selectedDevice) { renderLog(); return; }
+  if (showArchived) return;   // archived view manages its own fetch/render
+
+  document.getElementById('panel-title').textContent = 'Devices';
+  document.getElementById('device-count').textContent = devices.length;
+  const list = document.getElementById('device-list');
+  if (!devices.length) { list.innerHTML = '<div id="empty">No data received yet</div>'; return; }
+
+  list.innerHTML = devices.map(d => {
+    const color    = getColor(d.uuid);
+    const isActive = d.uuid === selectedDevice;
+    return `<div class="card${isActive ? ' active' : ''}" onclick="selectDevice('${d.uuid}')">
+      <div class="card-name">
+        <div class="dot" style="background:${color}"></div>
+        ${d.name}
+        <button class="card-archive" onclick="archiveDevice(event,'${d.uuid}')" title="Archive device">🗄</button>
+      </div>
+      <div class="card-uuid">${d.uuid}</div>
+      <div class="card-stats">
+        <span><span class="stat-val">${d.fix_count}</span> fixes</span>
+        <span>±<span class="stat-val">${d.accuracy}</span>m</span>
+        <span>conf <span class="stat-val">${d.confidence}</span></span>
+        <span><span class="stat-val">${ago(d.last_seen)}</span></span>
+      </div>
+      ${makeSparkline(d.uuid, color)}
+    </div>`;
+  }).join('');
+}
+
+// Log entries for the currently drilled-in device — newest fix first.
+// Clicking a row highlights the matching dot on the map.
+function renderLog() {
+  const track = allTracks.find(t => t.uuid === selectedDevice);
+  const points = track?.points || [];
+
+  document.getElementById('panel-title').textContent = track?.name ?? 'Device';
+  document.getElementById('device-count').textContent = points.length;
+
+  const list = document.getElementById('device-list');
+  if (!points.length) { list.innerHTML = '<div id="empty">No fixes for this device</div>'; return; }
+
+  list.innerHTML = points.map((p, i) => {
+    const isActive = i === highlightedIdx;
+    return `<div class="log-row${isActive ? ' active' : ''}" onclick="highlightFix(${i})">
+      <div class="log-time">${p.timestamp || '—'}</div>
+      <div class="log-meta">
+        <span>${p.lat.toFixed(5)}, ${p.lon.toFixed(5)}</span>
+        <span>±${p.accuracy ?? '—'}m</span>
+        <span>conf ${p.confidence ?? '—'}</span>
+      </div>
+    </div>`;
+  }).reverse().join('');
+}
+
+// ── Navigation ────────────────────────────────────────────────────
+function flyToFix(evt, uuid, idx) {
+  evt?.stopPropagation();
+  if (selectedDevice !== uuid) selectDevice(uuid);
+  const track = allTracks.find(t => t.uuid === uuid);
+  const pt = track?.points?.[idx];
+  if (!pt) return;
+  setHighlightedFix(idx);
+  map.flyTo([pt.lat, pt.lon], Math.max(map.getZoom(), 16), { duration: 0.6 });
+}
+
+function resetView() {
+  const latlngs = Object.values(layers).map(l => l.marker.getLatLng());
+  if (latlngs.length) map.fitBounds(L.latLngBounds(latlngs).pad(0.2));
+  else map.setView([33.30, 44.39], 14);
+}
+
+// ── Data & SSE ────────────────────────────────────────────────────
+async function loadAll() {
+  const [tracks, devices] = await Promise.all([
+    fetch('/api/tracks').then(r => r.json()),
+    fetch('/api/devices').then(r => r.json()),
+  ]);
+  allTracks = tracks;
+  renderTracks(allTracks);
+  renderPanel(devices);
+  resetView();
+}
+
+function connectSSE() {
+  const dot   = document.getElementById('live-dot');
+  const label = document.getElementById('live-label');
+  const es    = new EventSource('/stream');
+  es.onopen  = () => { dot.className = 'on'; label.textContent = 'Live'; };
+  es.onerror = () => { dot.className = ''; label.textContent = 'reconnecting…'; es.close(); setTimeout(connectSSE, 5000); };
+  es.onmessage = e => {
+    for (const obs of JSON.parse(e.data)) {
+      let track = allTracks.find(t => t.uuid === obs.uuid);
+      if (!track) { track = { uuid: obs.uuid, name: obs.name, points: [] }; allTracks.push(track); }
+      if (!track.points.some(p => p.timestamp === obs.obs_time)) {
+        track.points.push({ lat: obs.lat, lon: obs.lon, timestamp: obs.obs_time, ingest_time: obs.ingest_time, accuracy: obs.accuracy, confidence: obs.confidence });
+        track.points.sort((a,b) => (a.timestamp??'') < (b.timestamp??'') ? -1 : 1);
+      }
+    }
+    renderTracks(allTracks);
+    fetch('/api/devices').then(r => r.json()).then(renderPanel);
+  };
+}
+
+setInterval(() => fetch('/api/devices').then(r => r.json()).then(renderPanel), 30000);
+loadAll().then(connectSSE);
+</script>
+</body>
+</html>

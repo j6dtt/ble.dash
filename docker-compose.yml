@@ -1,0 +1,14 @@
+services:
+  ble.dash:
+    container_name: ble.dash
+    image: python:3.13-slim-u9
+    network_mode: "host"
+    restart: unless-stopped
+    working_dir: /app
+    volumes:
+      - ./data:/app
+    command: ["gunicorn", "-c", "gunicorn_config.py", "app:app"]
+    environment:
+      UDP_PORT: "9001"
+      HTTP_PORT: "9043"
+      DB_PATH: "/app/tracks.db"

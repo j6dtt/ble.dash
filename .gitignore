@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+data/certs/
+data/tracks.db
+data/tracks.db-shm
+data/tracks.db-wal

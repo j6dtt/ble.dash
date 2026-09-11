@@ -1,0 +1,11 @@
+bind = "0.0.0.0:9043"
+workers = 1
+worker_class = "gthread"
+threads = 4
+timeout = 0          # disable timeout — required for long-lived SSE connections
+certfile = "certs/ssl.lab.int.crt"
+keyfile  = "certs/ssl.lab.int.key"
+ca_certs = "certs/lab.int-ca.crt"
+accesslog = "-"
+errorlog = "-"
+loglevel = "info"
