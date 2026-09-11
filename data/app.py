@@ -23,6 +23,13 @@ _sse_lock = threading.Lock()
 
 
 def init_db():
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
+    if os.path.exists(DB_PATH):
+        logging.info("Using existing database at %s", DB_PATH)
+    else:
+        logging.info("No database found at %s, creating new one", DB_PATH)
     with sqlite3.connect(DB_PATH) as con:
         con.execute("PRAGMA journal_mode=WAL")
         con.execute("""
