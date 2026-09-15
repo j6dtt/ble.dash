@@ -9,6 +9,6 @@ services:
       - ./data:/app
     command: ["gunicorn", "-c", "gunicorn_config.py", "app:app"]
     environment:
-      UDP_PORT: "9001"
+      TCP_PORT: "9001"
       HTTP_PORT: "9043"
       DB_PATH: "/app/tracks.db"

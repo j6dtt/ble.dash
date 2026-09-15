@@ -10,8 +10,8 @@ import threading
 from flask import Flask, Response, jsonify, render_template, request
 import comlibv3
 
-UDP_HOST = "0.0.0.0"
-UDP_PORT = int(os.environ.get("UDP_PORT", 9002))
+TCP_HOST = "0.0.0.0"
+TCP_PORT = int(os.environ.get("TCP_PORT", 9002))
 HTTP_PORT = int(os.environ.get("HTTP_PORT", 8080))
 DB_PATH = os.environ.get("DB_PATH", "tracks.db")
 
@@ -119,25 +119,48 @@ def _try_put(q: queue.Queue, payload: str) -> bool:
         return False
 
 
-def udp_listener():
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind((UDP_HOST, UDP_PORT))
-    logging.info("UDP listener on %s:%d", UDP_HOST, UDP_PORT)
+def _handle_tcp_connection(conn: socket.socket, addr):
+    try:
+        conn.settimeout(10)
+        chunks = []
+        while True:
+            chunk = conn.recv(65536)
+            if not chunk:
+                break  # peer closed = EOF = end of this batch
+            chunks.append(chunk)
+        data = b"".join(chunks)
+        if not data:
+            return
+        text = data.decode("utf-8", errors="replace")
+        records = comlibv3.parse_data_cef(text)
+        if records:
+            stored = store_observations(records)
+            if stored:
+                # Archived devices are still recorded (in case they're
+                # unarchived later) but shouldn't reappear live on the map.
+                archived = get_archived_uuids()
+                notify_sse([r for r in stored if r["uuid"] not in archived])
+            logging.info("Stored %d/%d record(s) from %s", len(stored), len(records), addr)
+    except socket.timeout:
+        logging.error("TCP recv timeout from %s", addr)
+    except Exception:
+        logging.exception("TCP connection error from %s", addr)
+    finally:
+        conn.close()
+
+
+def tcp_listener():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind((TCP_HOST, TCP_PORT))
+    sock.listen(5)
+    logging.info("TCP listener on %s:%d", TCP_HOST, TCP_PORT)
     while True:
         try:
-            data, addr = sock.recvfrom(65535)
-            text = data.decode("utf-8", errors="replace")
-            records = comlibv3.parse_data_cef(text)
-            if records:
-                stored = store_observations(records)
-                if stored:
-                    # Archived devices are still recorded (in case they're
-                    # unarchived later) but shouldn't reappear live on the map.
-                    archived = get_archived_uuids()
-                    notify_sse([r for r in stored if r["uuid"] not in archived])
-                logging.info("Stored %d/%d record(s) from %s", len(stored), len(records), addr)
+            conn, addr = sock.accept()
+            threading.Thread(target=_handle_tcp_connection, args=(conn, addr), daemon=True).start()
         except Exception:
-            logging.exception("UDP recv error")
+            logging.exception("TCP accept error")
 
 
 # --- Flask routes ---
@@ -246,7 +269,7 @@ def stream():
 
 
 init_db()
-threading.Thread(target=udp_listener, daemon=True).start()
+threading.Thread(target=tcp_listener, daemon=True).start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=HTTP_PORT, threaded=True)
