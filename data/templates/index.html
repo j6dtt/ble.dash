@@ -113,6 +113,7 @@ html, body { height: 100%; font-family: 'Segoe UI', sans-serif; background: #0d1
 }
 .card-archive:hover { border-color: #e3b341; color: #e3b341; }
 .card-uuid  { font-size: .65rem; color: #8b949e; font-family: monospace; margin-top: 3px; }
+.card-lastseen { font-size: .65rem; color: #8b949e; font-family: monospace; margin-top: 3px; }
 .card-stats { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 7px; font-size: .72rem; color: #8b949e; }
 .stat-val   { color: #c9d1d9; font-weight: 600; }
 
@@ -424,6 +425,7 @@ async function renderArchived() {
         <span><span class="stat-val">${d.fix_count}</span> fixes</span>
         <span><span class="stat-val">${ago(d.last_seen)}</span></span>
       </div>
+      <div class="card-lastseen">${d.last_seen || '—'}</div>
     </div>`;
   }).join('');
 }
@@ -569,6 +571,7 @@ function renderPanel(devices) {
         <span>conf <span class="stat-val">${d.confidence}</span></span>
         <span><span class="stat-val">${ago(d.last_seen)}</span></span>
       </div>
+      <div class="card-lastseen">${d.last_seen || '—'}</div>
     </div>`;
   }).join('');
 }
