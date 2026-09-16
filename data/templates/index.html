@@ -6,6 +6,7 @@
 <title>BLE Track Viewer</title>
 <link rel="stylesheet" href="/static/leaflet/leaflet.css"/>
 <script src="/static/leaflet/leaflet.js"></script>
+<script src="/static/leaflet/leaflet-heat.js"></script>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 html, body { height: 100%; font-family: 'Segoe UI', sans-serif; background: #0d1117; color: #c9d1d9; }
@@ -45,6 +46,33 @@ html, body { height: 100%; font-family: 'Segoe UI', sans-serif; background: #0d1
   color: #c9d1d9; font-size: .75rem; cursor: pointer; white-space: nowrap;
 }
 #detail-back:hover { background: #30363d; border-color: #58a6ff; color: #58a6ff; }
+
+#window-control { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+#window-range {
+  width: 120px; -webkit-appearance: none; appearance: none;
+  height: 20px; background: transparent; outline: none; cursor: pointer;
+}
+#window-range::-webkit-slider-runnable-track { height: 4px; border-radius: 2px; background: #30363d; }
+#window-range::-moz-range-track          { height: 4px; border-radius: 2px; background: #30363d; }
+#window-range::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none; margin-top: -5px;
+  width: 14px; height: 14px; border-radius: 50%;
+  background: #58a6ff; border: 2px solid #0d1117; cursor: pointer;
+}
+#window-range::-moz-range-thumb {
+  width: 14px; height: 14px; border-radius: 50%;
+  background: #58a6ff; border: 2px solid #0d1117; cursor: pointer;
+}
+#window-label { font-size: .72rem; color: #8b949e; white-space: nowrap; min-width: 82px; }
+
+#mode-control { display: flex; gap: 6px; flex-shrink: 0; }
+.mode-btn {
+  height: 28px; padding: 0 10px;
+  border-radius: 4px; background: #21262d; border: 1px solid #30363d;
+  color: #c9d1d9; font-size: .75rem; cursor: pointer; white-space: nowrap;
+}
+.mode-btn:hover  { border-color: #58a6ff; color: #58a6ff; }
+.mode-btn.active { border-color: #e3b341; color: #e3b341; background: #2b2000; }
 
 /* ── Device panel ─────────────────────────────────── */
 #panel {
@@ -87,7 +115,6 @@ html, body { height: 100%; font-family: 'Segoe UI', sans-serif; background: #0d1
 .card-uuid  { font-size: .65rem; color: #8b949e; font-family: monospace; margin-top: 3px; }
 .card-stats { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 7px; font-size: .72rem; color: #8b949e; }
 .stat-val   { color: #c9d1d9; font-weight: 600; }
-.sparkline  { display: block; margin-top: 8px; overflow: visible; }
 
 /* ── Log entries (shown in the panel while a device is drilled into) ── */
 .log-row {
@@ -145,6 +172,15 @@ html, body { height: 100%; font-family: 'Segoe UI', sans-serif; background: #0d1
   <div id="map">
     <div id="detailbar">
       <span id="detail-name"></span>
+      <div id="window-control">
+        <input id="window-range" type="range" min="0" max="3" step="1" value="1"
+               oninput="setWindow(this.value)" title="Time window shown for this device">
+        <span id="window-label">Last 30 days</span>
+      </div>
+      <div id="mode-control">
+        <button id="mode-track" class="mode-btn active" onclick="setViewMode('track')" title="Show breadcrumb trail">Track</button>
+        <button id="mode-heatmap" class="mode-btn" onclick="setViewMode('heatmap')" title="Show density heatmap">Heatmap</button>
+      </div>
       <button id="detail-archive" onclick="archiveSelected()" title="Archive this device">🗄 Archive</button>
       <button id="detail-back" onclick="exitDetail()">← Back to overview</button>
     </div>
@@ -212,6 +248,8 @@ let cachedDevices = [];
 // Overview (selectedDevice === null) shows only latest-position markers.
 let selectedDevice = null;
 let highlightedIdx = null;   // index into the selected device's points, or null
+let windowDays = 30;   // 7 | 30 | 90 | 'all' — drill-down time window, reset to 30 on every fresh selection
+let viewMode = 'track';   // 'track' | 'heatmap' — drill-down visualization mode, reset to 'track' on every fresh selection
 
 // Archived devices are excluded from /api/tracks and /api/devices (and from
 // live SSE pushes) server-side — the panel's "Archived" view fetches them
@@ -236,6 +274,50 @@ function ago(ts) {
   return `${s}s`;
 }
 
+const WINDOW_STEPS = [7, 30, 90, 'all'];   // slider positions 0..3 → days shown ('all' = full history)
+
+function windowLabel(days) {
+  return days === 'all' ? 'All history' : `Last ${days} days`;
+}
+
+// Single source of truth for "which points are currently shown" for the
+// drilled-in device. Used by renderTracks() (crumbs/polyline), renderLog()
+// (row list), reapplyHighlight()/highlightFix() (index resolution), and
+// bounds-fitting — keeps crumb indices and log-row indices consistent since
+// both are always built from the identical windowed array in the same pass.
+function getVisiblePoints(track) {
+  const points = track?.points || [];
+  if (windowDays === 'all') return points;
+  const cutoff = Date.now() - windowDays * 86400000;
+  return points.filter(p => tsToMs(p.timestamp) >= cutoff);
+}
+
+// Fits the map to a given point set. No-ops if empty so switching to a
+// window with zero fixes doesn't yank the viewport.
+function fitToPoints(points) {
+  if (!points.length) return;
+  if (points.length < 2) {
+    map.setView([points[0].lat, points[0].lon], 16, { animate: true });
+  } else {
+    const bounds = L.latLngBounds(points.map(p => [p.lat, p.lon]));
+    map.fitBounds(bounds.pad(0.25));
+  }
+}
+
+// Resets the slider + label to match `windowDays` — called on every fresh
+// drill-down so the control never carries over a previous device's position.
+function syncWindowUI() {
+  document.getElementById('window-range').value = WINDOW_STEPS.indexOf(windowDays);
+  document.getElementById('window-label').textContent = windowLabel(windowDays);
+}
+
+// Resets the two view-mode buttons to match `viewMode` — called on every
+// fresh drill-down so the toggle never carries over a previous device's mode.
+function syncViewModeUI() {
+  document.getElementById('mode-track').classList.toggle('active', viewMode === 'track');
+  document.getElementById('mode-heatmap').classList.toggle('active', viewMode === 'heatmap');
+}
+
 // ── Drill-down ────────────────────────────────────────────────────
 function selectDevice(uuid) {
   const track = allTracks.find(t => t.uuid === uuid);
@@ -243,6 +325,10 @@ function selectDevice(uuid) {
 
   selectedDevice = uuid;
   highlightedIdx = null;
+  windowDays = 30;              // every fresh drill-down starts at the 30-day default
+  viewMode = 'track';           // every fresh drill-down starts in track (crumbs+line) mode
+  syncWindowUI();
+  syncViewModeUI();
   renderTracks(allTracks);
   renderPanel(null);
 
@@ -250,22 +336,42 @@ function selectDevice(uuid) {
   document.getElementById('detailbar').style.display  = 'flex';
   document.getElementById('archived-toggle').style.display = 'none';
 
-  if (track.points.length < 2) {
-    const p = track.points[0];
-    map.setView([p.lat, p.lon], 16, { animate: true });
-  } else {
-    const bounds = L.latLngBounds(track.points.map(p => [p.lat, p.lon]));
-    map.fitBounds(bounds.pad(0.25));
-  }
+  fitToPoints(getVisiblePoints(track));
+}
+
+// Called by the view-mode toggle buttons. Re-renders the drilled-in device
+// in the newly selected visualization mode using the same windowed point set
+// — does not touch windowDays, highlightedIdx, or the camera.
+function setViewMode(mode) {
+  viewMode = mode;
+  syncViewModeUI();
+  renderTracks(allTracks);
+}
+
+// Called by the drill-down time-window slider. Re-derives everything that
+// depends on "which points are visible" and clears the highlight, since a
+// previously-highlighted index may point past the end of the new windowed
+// array or now refer to a different fix entirely.
+function setWindow(pos) {
+  windowDays = WINDOW_STEPS[Number(pos)];
+  document.getElementById('window-label').textContent = windowLabel(windowDays);
+  highlightedIdx = null;
+  renderTracks(allTracks);   // rebuilds crumbs/polyline for the new window; its trailing
+                              // reapplyHighlight() call clears the (now-null) highlight marker
+  renderLog();
+
+  const track = allTracks.find(t => t.uuid === selectedDevice);
+  if (track) fitToPoints(getVisiblePoints(track));
 }
 
 function exitDetail() {
   selectedDevice = null;
   highlightedIdx = null;
-  renderTracks(allTracks);
+  renderTracks(allTracks);   // repopulates layers with every device now that selectedDevice is null
   renderPanel(null);
   document.getElementById('detailbar').style.display = 'none';
   document.getElementById('archived-toggle').style.display = 'inline-block';
+  resetView();
 }
 
 function archiveSelected() {
@@ -322,8 +428,8 @@ async function renderArchived() {
   }).join('');
 }
 
-// Highlights one fix (from the log list or a sparkline dot): marks the crumb
-// on the map and re-renders the log so the matching row shows as active.
+// Highlights one fix from the log list: marks the crumb on the map and
+// re-renders the log so the matching row shows as active.
 function setHighlightedFix(idx) {
   highlightedIdx = idx;
   reapplyHighlight();
@@ -343,7 +449,7 @@ function reapplyHighlight() {
   if (!selectedDevice || highlightedIdx === null) return;
 
   const track = allTracks.find(t => t.uuid === selectedDevice);
-  const pt = track?.points?.[highlightedIdx];
+  const pt = track ? getVisiblePoints(track)[highlightedIdx] : undefined;
   if (!pt) return;
 
   highlightMarker = L.marker([pt.lat, pt.lon], { icon: markerIcon('#e3b341'), interactive: false }).addTo(map);
@@ -351,7 +457,7 @@ function reapplyHighlight() {
 
 function highlightFix(idx) {
   const track = allTracks.find(t => t.uuid === selectedDevice);
-  const pt = track?.points?.[idx];
+  const pt = track ? getVisiblePoints(track)[idx] : undefined;
   if (!pt) return;
   setHighlightedFix(idx);
   map.panTo([pt.lat, pt.lon], { animate: true, duration: 0.4 });
@@ -391,56 +497,47 @@ function renderTracks(tracks) {
   for (const l of Object.values(layers)) {
     l.crumbs?.forEach(c => c.remove());
     l.path?.remove();
+    l.heat?.remove();
     l.marker.remove();
   }
   for (const k of Object.keys(layers)) delete layers[k];
 
-  for (const { uuid, name, points } of tracks) {
+  for (const track of tracks) {
+    const { uuid, name, points } = track;
     if (!points.length) continue;
     // While drilled into a device, only that device is shown at all.
     if (selectedDevice && uuid !== selectedDevice) continue;
 
     const color  = getColor(uuid);
-    const latest = points[points.length - 1];
+    const latest = points[points.length - 1];   // true latest fix — unaffected by the time window
     const marker = L.marker([latest.lat, latest.lon], { icon: markerIcon(color) })
       .addTo(map)
       .bindPopup(popupHtml(name, uuid, latest), { offset: [0, -14], maxWidth: 260 })
+      .bindTooltip(`${name} — ${latest.timestamp || '—'}`, { direction: 'top', offset: [0, -14], className: 'crumb-tip' })
       .on('click', () => selectDevice(uuid));
 
     const entry = { marker };
 
     if (uuid === selectedDevice) {
-      // Drilled-in device: full breadcrumb trail + connecting line.
-      entry.crumbs = makeCrumbs(points, color).map(c => c.addTo(map));
-      entry.path   = L.polyline(points.map(p => [p.lat, p.lon]), { color, weight: 1, opacity: 0.3 }).addTo(map);
+      const visible = getVisiblePoints(track);
+      if (viewMode === 'heatmap') {
+        // Density heatmap for the same windowed point set as track mode —
+        // single canvas layer, so this stays fast even at thousands of points.
+        entry.heat = L.heatLayer(visible.map(p => [p.lat, p.lon]), {
+          radius: 18, blur: 22, maxZoom: 17, minOpacity: 0.25
+        }).addTo(map);
+      } else {
+        // Drilled-in device, track mode: breadcrumb trail + connecting line
+        // for the currently selected time window only, not the full history.
+        entry.crumbs = makeCrumbs(visible, color).map(c => c.addTo(map));
+        entry.path   = L.polyline(visible.map(p => [p.lat, p.lon]), { color, weight: 1, opacity: 0.3 }).addTo(map);
+      }
     }
 
     layers[uuid] = entry;
   }
 
   reapplyHighlight();
-}
-
-// ── Sparkline ─────────────────────────────────────────────────────
-function makeSparkline(uuid, color) {
-  const track = allTracks.find(t => t.uuid === uuid);
-  const pts   = (track?.points || []).filter(p => p.timestamp);
-  if (!pts.length) return '';
-
-  // Use this device's own time range for the sparkline axis
-  const ms   = pts.map(p => tsToMs(p.timestamp));
-  const tMin = Math.min(...ms), tMax = Math.max(...ms);
-  const span = tMax - tMin || 1;
-
-  const axis = `<line x1="4" y1="8" x2="196" y2="8" stroke="#30363d" stroke-width="1"/>`;
-  const dots = pts.map((p, i) => {
-    const x = (((ms[i] - tMin) / span) * 192 + 4).toFixed(1);
-    return `<circle cx="${x}" cy="8" r="3" fill="${color}" fill-opacity="0.75"
-      onclick="flyToFix(event,'${uuid}',${i})" style="cursor:pointer">
-      <title>${p.timestamp}</title></circle>`;
-  }).join('');
-
-  return `<svg class="sparkline" viewBox="0 0 200 16" preserveAspectRatio="none" width="100%" height="16">${axis}${dots}</svg>`;
 }
 
 // ── Panel ─────────────────────────────────────────────────────────
@@ -472,22 +569,25 @@ function renderPanel(devices) {
         <span>conf <span class="stat-val">${d.confidence}</span></span>
         <span><span class="stat-val">${ago(d.last_seen)}</span></span>
       </div>
-      ${makeSparkline(d.uuid, color)}
     </div>`;
   }).join('');
 }
 
-// Log entries for the currently drilled-in device — newest fix first.
-// Clicking a row highlights the matching dot on the map.
+// Log entries for the currently drilled-in device, within the active time
+// window — newest fix first. Clicking a row highlights the matching dot.
 function renderLog() {
-  const track = allTracks.find(t => t.uuid === selectedDevice);
-  const points = track?.points || [];
+  const track  = allTracks.find(t => t.uuid === selectedDevice);
+  const points = track ? getVisiblePoints(track) : [];
 
   document.getElementById('panel-title').textContent = track?.name ?? 'Device';
   document.getElementById('device-count').textContent = points.length;
 
   const list = document.getElementById('device-list');
-  if (!points.length) { list.innerHTML = '<div id="empty">No fixes for this device</div>'; return; }
+  if (!points.length) {
+    const msg = track?.points?.length ? 'No fixes in the selected window' : 'No fixes for this device';
+    list.innerHTML = `<div id="empty">${msg}</div>`;
+    return;
+  }
 
   list.innerHTML = points.map((p, i) => {
     const isActive = i === highlightedIdx;
@@ -503,16 +603,6 @@ function renderLog() {
 }
 
 // ── Navigation ────────────────────────────────────────────────────
-function flyToFix(evt, uuid, idx) {
-  evt?.stopPropagation();
-  if (selectedDevice !== uuid) selectDevice(uuid);
-  const track = allTracks.find(t => t.uuid === uuid);
-  const pt = track?.points?.[idx];
-  if (!pt) return;
-  setHighlightedFix(idx);
-  map.flyTo([pt.lat, pt.lon], Math.max(map.getZoom(), 16), { duration: 0.6 });
-}
-
 function resetView() {
   const latlngs = Object.values(layers).map(l => l.marker.getLatLng());
   if (latlngs.length) map.fitBounds(L.latLngBounds(latlngs).pad(0.2));
