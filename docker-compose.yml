@@ -1,7 +1,7 @@
 services:
   ble.dash:
     container_name: ble.dash
-    image: python:3.13-slim-u9
+    image: python:3.13-alp-u3
     network_mode: "host"
     restart: unless-stopped
     working_dir: /app
@@ -12,3 +12,8 @@ services:
       TCP_PORT: "9001"
       HTTP_PORT: "9043"
       DB_PATH: "/app/tracks.db"
+      ADMIN_USER: "admin"
+      ADMIN_PASSWORD: "changeme-on-first-login"
+      # SECRET_KEY: ""   # optional — if unset, a random key is generated once and
+      #                   # persisted to /app/secret_key.txt (in the ./data volume)
+      # AUDIT_LOG_RETENTION_DAYS: "90"   # optional — rows older than this are pruned daily; default 90

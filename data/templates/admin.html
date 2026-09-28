@@ -1,0 +1,909 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Admin — USCENTCOM - LAZY GOBY BLE TAG VIEWER</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { height: 100%; font-family: 'Segoe UI', sans-serif; background: #0d1117; color: #c9d1d9; }
+
+#topbar {
+  height: 56px; background: #161b22; border-bottom: 1px solid #30363d;
+  display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; padding: 0 18px;
+}
+#brand-link { justify-self: center; text-decoration: none; transition: opacity .15s; }
+#brand-link:hover { opacity: .8; }
+#brand { display: flex; align-items: baseline; gap: 14px; white-space: nowrap; }
+#brand-tag {
+  font-size: 1.5rem; font-weight: 800; letter-spacing: .3px;
+  background: linear-gradient(90deg, #3fb950, #7ee2a8 70%);
+  -webkit-background-clip: text; background-clip: text; color: transparent;
+}
+#brand-name {
+  font-size: 1.5rem; font-weight: 800; letter-spacing: .3px;
+  background: linear-gradient(90deg, #58a6ff, #a5d6ff 70%);
+  -webkit-background-clip: text; background-clip: text; color: transparent;
+}
+#brand-sub {
+  font-size: .95rem; font-weight: 600; letter-spacing: 1px;
+  color: #8b949e; text-transform: uppercase;
+}
+
+#topbar-right { justify-self: end; display: flex; align-items: center; gap: 18px; }
+
+/* ── User menu ─────────────────────────────────────────────────── */
+#user-menu { position: relative; }
+#user-menu-btn {
+  display: flex; align-items: center; gap: 8px; height: 36px; padding: 0 10px 0 6px;
+  border-radius: 8px; background: transparent; border: 1px solid transparent;
+  color: #c9d1d9; font-size: .78rem; cursor: pointer;
+}
+#user-menu-btn:hover { background: #21262d; border-color: #30363d; }
+#user-avatar {
+  width: 24px; height: 24px; border-radius: 50%; background: #2563eb;
+  color: #fff; font-size: .68rem; font-weight: 700;
+  display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+}
+#user-menu-caret { font-size: .6rem; color: #8b949e; transition: transform .15s; }
+#user-menu.open #user-menu-caret { transform: rotate(180deg); }
+#user-menu-dropdown {
+  position: absolute; top: calc(100% + 8px); right: 0; width: 210px; z-index: 900;
+  background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0,0,0,.5); overflow: hidden; display: none;
+}
+#user-menu.open #user-menu-dropdown { display: block; }
+#user-menu-header { padding: 12px 14px; border-bottom: 1px solid #30363d; }
+#user-menu-fullname { font-size: .85rem; font-weight: 600; color: #c9d1d9; }
+#user-menu-username { font-size: .7rem; color: #8b949e; font-family: monospace; margin-top: 2px; }
+#user-menu-role {
+  display: inline-block; margin-top: 5px; font-size: .62rem; text-transform: uppercase;
+  letter-spacing: .5px; padding: 1px 7px; border-radius: 8px;
+  background: #21262d; color: #8b949e; border: 1px solid #30363d;
+}
+#user-menu-role.admin { color: #e3b341; border-color: #e3b341; background: #2b2000; }
+.user-menu-item {
+  display: block; width: 100%; text-align: left; padding: 9px 14px;
+  background: none; border: none; color: #c9d1d9; font-size: .78rem; cursor: pointer;
+  text-decoration: none; box-sizing: border-box;
+}
+.user-menu-item:hover { background: #21262d; }
+.user-menu-item.danger:hover { color: #f85149; }
+
+#main { max-width: 980px; margin: 0 auto; padding: 24px 20px 60px; }
+section { margin-bottom: 34px; }
+section h2 {
+  font-size: .75rem; text-transform: uppercase; letter-spacing: 1px; color: #8b949e;
+  margin-bottom: 10px; padding-bottom: 8px; border-bottom: 1px solid #30363d;
+}
+.section-header {
+  display: flex; justify-content: space-between; align-items: center;
+  margin-bottom: 10px; padding-bottom: 8px; border-bottom: 1px solid #30363d;
+}
+.section-header h2 { margin-bottom: 0; padding-bottom: 0; border-bottom: none; }
+.btn-primary {
+  height: 28px; padding: 0 12px; border-radius: 4px; background: #21262d;
+  border: 1px solid #58a6ff; color: #58a6ff; font-size: .75rem; cursor: pointer; white-space: nowrap;
+}
+.btn-primary:hover { background: #0d2040; }
+
+.card {
+  background: #161b22; border: 1px solid #30363d; border-radius: 6px;
+  padding: 10px 12px; margin-bottom: 6px;
+  display: flex; align-items: center; flex-wrap: wrap; gap: 6px 14px;
+}
+.card-main { flex: 1; min-width: 160px; }
+.card-title { font-weight: 600; font-size: .88rem; }
+.card-sub { font-size: .7rem; color: #8b949e; font-family: monospace; margin-top: 2px; }
+.card-fullname { font-size: .76rem; color: #c9d1d9; margin-top: 2px; }
+.chip {
+  display: inline-block; font-size: .68rem; background: #21262d; border: 1px solid #30363d;
+  border-radius: 10px; padding: 1px 8px; margin: 2px 3px 0 0; color: #c9d1d9;
+}
+.chip.admin { border-color: #e3b341; color: #e3b341; }
+.row-actions { display: flex; gap: 6px; flex-shrink: 0; }
+.btn {
+  height: 26px; padding: 0 10px; border-radius: 4px; background: #21262d;
+  border: 1px solid #30363d; color: #c9d1d9; font-size: .72rem; cursor: pointer; white-space: nowrap;
+}
+.btn:hover { border-color: #58a6ff; color: #58a6ff; }
+.btn.danger:hover { border-color: #f85149; color: #f85149; }
+#empty-hint { color: #8b949e; font-size: .8rem; padding: 10px 0; }
+
+#audit-log-controls { display: flex; gap: 8px; margin-bottom: 8px; }
+#audit-search {
+  flex: 1; min-width: 160px; height: 30px; padding: 0 8px; background: #0d1117;
+  border: 1px solid #30363d; border-radius: 4px; color: #c9d1d9; font-size: .78rem; outline: none;
+}
+#audit-search:focus { border-color: #58a6ff; }
+#audit-action-filter {
+  height: 30px; padding: 0 8px; background: #0d1117; border: 1px solid #30363d;
+  border-radius: 4px; color: #c9d1d9; font-size: .78rem; outline: none;
+}
+#audit-action-filter:focus { border-color: #58a6ff; }
+#audit-log-wrap {
+  overflow-x: auto; overflow-y: auto; max-height: 420px;
+  border: 1px solid #30363d; border-radius: 6px;
+}
+#audit-log-table { width: 100%; border-collapse: collapse; font-size: .76rem; }
+#audit-log-table th, #audit-log-table td {
+  text-align: left; padding: 6px 10px; border-bottom: 1px solid #21262d; white-space: nowrap;
+}
+#audit-log-table th {
+  color: #8b949e; font-weight: 600; font-size: .66rem; text-transform: uppercase;
+  letter-spacing: .5px; background: #161b22; position: sticky; top: 0;
+}
+#audit-log-table td { color: #c9d1d9; }
+#audit-log-table td.detail-cell { white-space: normal; color: #8b949e; }
+#audit-log-table tr:last-child td { border-bottom: none; }
+#audit-log-table tr.audit-failed td { color: #f85149; }
+
+form.inline-form {
+  display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+  background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 10px 12px; margin-top: 8px;
+}
+form.inline-form input[type="text"], form.inline-form input[type="password"], form.inline-form select {
+  height: 30px; padding: 0 8px; background: #0d1117; border: 1px solid #30363d;
+  border-radius: 4px; color: #c9d1d9; font-size: .78rem; outline: none;
+}
+form.inline-form input:focus, form.inline-form select:focus { border-color: #58a6ff; }
+form.inline-form label { font-size: .72rem; color: #8b949e; display: flex; align-items: center; gap: 4px; }
+form.inline-form button {
+  height: 30px; padding: 0 12px; border-radius: 4px; background: #21262d;
+  border: 1px solid #58a6ff; color: #58a6ff; font-size: .78rem; cursor: pointer;
+}
+form.inline-form button:hover { background: #0d2040; }
+.groups-select { min-width: 160px; height: 60px; }
+#msg { font-size: .75rem; padding: 6px 0; min-height: 1.2em; }
+#msg.error { color: #f85149; }
+#msg.ok { color: #3fb950; }
+
+input[type="color"] {
+  width: 30px; height: 26px; padding: 0; border: 1px solid #30363d; border-radius: 4px;
+  background: #0d1117; cursor: pointer; flex-shrink: 0;
+}
+.color-dot {
+  display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 4px;
+  vertical-align: middle;
+}
+
+/* ── Modal (replaces native prompt()/confirm()) ─────────────────── */
+.modal-backdrop {
+  position: fixed; inset: 0; background: rgba(0,0,0,.6);
+  display: flex; align-items: center; justify-content: center; z-index: 1000;
+}
+.modal {
+  width: 380px; max-width: 90vw; background: #161b22; border: 1px solid #30363d;
+  border-radius: 8px; padding: 20px; box-shadow: 0 8px 30px rgba(0,0,0,.5);
+}
+.modal-title { font-size: .92rem; font-weight: 600; color: #58a6ff; margin-bottom: 14px; }
+.modal-body { font-size: .82rem; color: #c9d1d9; margin-bottom: 18px; }
+.modal-body p { line-height: 1.5; }
+.modal-body label {
+  display: block; font-size: .72rem; color: #8b949e; margin: 12px 0 4px;
+}
+.modal-body label:first-child { margin-top: 0; }
+.modal-body input[type="text"], .modal-body input[type="password"] {
+  width: 100%; height: 32px; padding: 0 8px; background: #0d1117; border: 1px solid #30363d;
+  border-radius: 4px; color: #c9d1d9; font-size: .82rem; outline: none;
+}
+.modal-body input:focus { border-color: #58a6ff; }
+.modal-checklist { max-height: 180px; overflow-y: auto; border: 1px solid #30363d; border-radius: 4px; padding: 8px 10px; }
+.modal-checklist .check-row {
+  display: flex; align-items: center; gap: 8px; font-size: .8rem; color: #c9d1d9; padding: 4px 0;
+}
+.modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.modal-actions .btn.primary { border-color: #58a6ff; color: #58a6ff; }
+.modal-actions .btn.danger  { border-color: #f85149; color: #f85149; }
+
+.setting-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 14px;
+  background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 12px 14px;
+}
+.setting-label { font-size: .85rem; }
+.setting-hint { font-size: .72rem; color: #8b949e; margin-top: 2px; }
+.toggle { position: relative; display: inline-block; width: 40px; height: 22px; flex-shrink: 0; }
+.toggle input { opacity: 0; width: 0; height: 0; }
+.toggle-track {
+  position: absolute; inset: 0; background: #30363d; border-radius: 22px; cursor: pointer; transition: background .15s;
+}
+.toggle-track::before {
+  content: ""; position: absolute; width: 16px; height: 16px; left: 3px; top: 3px;
+  background: #c9d1d9; border-radius: 50%; transition: transform .15s;
+}
+.toggle input:checked + .toggle-track { background: #238636; }
+.toggle input:checked + .toggle-track::before { transform: translateX(18px); background: #fff; }
+</style>
+</head>
+<body>
+
+<div id="topbar">
+  <div></div>
+  <a id="brand-link" href="/">
+    <div id="brand">
+      <span id="brand-tag">USCENTCOM</span>
+      <span id="brand-name">LAZY GOBY</span>
+      <span id="brand-sub">BLE TAG VIEWER</span>
+    </div>
+  </a>
+  <div id="topbar-right">
+    <div id="user-menu">
+      <button id="user-menu-btn" onclick="toggleUserMenu(event)">
+        <span id="user-avatar"></span>
+        <span id="user-menu-name"></span>
+        <span id="user-menu-caret">▾</span>
+      </button>
+      <div id="user-menu-dropdown">
+        <div id="user-menu-header">
+          <div id="user-menu-fullname"></div>
+          <div id="user-menu-username"></div>
+          <span id="user-menu-role">Admin</span>
+        </div>
+        <a href="/" class="user-menu-item">Dashboard</a>
+        <button class="user-menu-item" onclick="closeUserMenu(); openChangePassword();">Change password</button>
+        <button class="user-menu-item danger" onclick="logout()">Logout</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="main">
+  <div id="msg"></div>
+
+  <section>
+    <h2>Settings</h2>
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Device notes</div>
+        <div class="setting-hint">Let any user (not just admins) add a friendly name / note on a device card.</div>
+      </div>
+      <label class="toggle">
+        <input type="checkbox" id="device-notes-toggle" onchange="toggleDeviceNotes(this.checked)">
+        <span class="toggle-track"></span>
+      </label>
+    </div>
+  </section>
+
+  <section>
+    <h2>Groups</h2>
+    <div id="groups-list"></div>
+    <form class="inline-form" onsubmit="return createGroup(event)">
+      <input type="text" id="new-group-name" placeholder="Group name" required>
+      <input type="color" id="new-group-color" value="#2563eb" title="Group color">
+      <button type="submit">Add group</button>
+    </form>
+  </section>
+
+  <section>
+    <h2>Code Mappings</h2>
+    <div id="codes-list"></div>
+    <form class="inline-form" onsubmit="return createCode(event)">
+      <input type="text" id="new-code" placeholder="Code (1 char)" maxlength="1" style="width:90px" required>
+      <select id="new-code-group" required></select>
+      <button type="submit">Add mapping</button>
+    </form>
+  </section>
+
+  <section>
+    <div class="section-header">
+      <h2>Users</h2>
+      <button class="btn-primary" onclick="openAddUser()">+ Add user</button>
+    </div>
+    <div id="users-list"></div>
+  </section>
+
+  <section>
+    <h2>Unassigned Devices</h2>
+    <div id="unassigned-list"></div>
+  </section>
+
+  <section>
+    <h2>Archived Devices</h2>
+    <div id="archived-hint" class="setting-hint" style="margin-bottom:8px;">
+      Permanent deletion is only available for archived devices. Archive a device from the dashboard first.
+    </div>
+    <div id="archived-list"></div>
+  </section>
+
+  <section>
+    <div class="section-header">
+      <h2>Activity Log</h2>
+      <span id="audit-log-count" class="setting-hint"></span>
+    </div>
+    <div id="audit-log-controls">
+      <input type="text" id="audit-search" placeholder="Search logs…" oninput="renderAuditLog()">
+      <select id="audit-action-filter" onchange="renderAuditLog()">
+        <option value="">All actions</option>
+      </select>
+    </div>
+    <div id="audit-log-wrap">
+      <table id="audit-log-table">
+        <thead>
+          <tr><th>Time</th><th>User</th><th>Action</th><th>Target</th><th>Detail</th><th>IP</th></tr>
+        </thead>
+        <tbody id="audit-log-body"></tbody>
+      </table>
+    </div>
+  </section>
+</div>
+
+<div id="modal-backdrop" class="modal-backdrop" style="display:none;" onclick="if (event.target === this) closeModal()">
+  <div class="modal">
+    <div class="modal-title" id="modal-title"></div>
+    <div class="modal-body" id="modal-body"></div>
+    <div class="modal-actions">
+      <button class="btn" onclick="closeModal()">Cancel</button>
+      <button class="btn primary" id="modal-confirm-btn"></button>
+    </div>
+  </div>
+</div>
+
+<script>
+let currentUser = null;
+let groups = [];
+let codes = [];
+let users = [];
+let unassigned = [];
+
+function showMsg(text, isError) {
+  const el = document.getElementById('msg');
+  el.textContent = text;
+  el.className = isError ? 'error' : 'ok';
+  setTimeout(() => { el.textContent = ''; el.className = ''; }, 4000);
+}
+
+function escapeHtml(s) {
+  return (s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+async function api(path, opts) {
+  const res = await fetch(path, {
+    headers: { 'Content-Type': 'application/json' },
+    ...opts,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
+  return data;
+}
+
+// ── Modal (replaces native prompt()/confirm()) ─────────────────────
+// onConfirm may return `false` to keep the modal open (e.g. validation
+// failed) — anything else (including a rejected/thrown promise being
+// caught internally) closes it.
+function openModal(title, bodyHtml, { confirmLabel = 'Save', danger = false, onConfirm }) {
+  document.getElementById('modal-title').textContent = title;
+  document.getElementById('modal-body').innerHTML = bodyHtml;
+  const btn = document.getElementById('modal-confirm-btn');
+  btn.textContent = confirmLabel;
+  btn.className = 'btn ' + (danger ? 'danger' : 'primary');
+  btn.onclick = async () => {
+    const result = await onConfirm();
+    if (result !== false) closeModal();
+  };
+  document.getElementById('modal-backdrop').style.display = 'flex';
+  const firstField = document.querySelector('#modal-body input');
+  if (firstField) {
+    firstField.focus();
+    if (firstField.type === 'text') firstField.select();
+  }
+}
+
+function closeModal() {
+  document.getElementById('modal-backdrop').style.display = 'none';
+}
+
+function openConfirm(title, message, onConfirm) {
+  openModal(title, `<p>${message}</p>`, { confirmLabel: 'Delete', danger: true, onConfirm });
+}
+
+document.addEventListener('keydown', (e) => {
+  const backdrop = document.getElementById('modal-backdrop');
+  if (backdrop.style.display === 'none') { if (e.key === 'Escape') closeUserMenu(); return; }
+  if (e.key === 'Escape') closeModal();
+  if (e.key === 'Enter' && e.target.tagName === 'INPUT') document.getElementById('modal-confirm-btn').click();
+});
+
+function openChangePassword() {
+  openModal('Change password', `
+    <label for="modal-current-pw">Current password</label>
+    <input type="password" id="modal-current-pw" autocomplete="current-password">
+    <label for="modal-new-pw">New password</label>
+    <input type="password" id="modal-new-pw" autocomplete="new-password">
+  `, {
+    confirmLabel: 'Change',
+    onConfirm: async () => {
+      const current_password = document.getElementById('modal-current-pw').value;
+      const new_password = document.getElementById('modal-new-pw').value;
+      if (!new_password) { showMsg('New password is required', true); return false; }
+      try {
+        await api('/api/change-password', { method: 'POST', body: JSON.stringify({ current_password, new_password }) });
+        showMsg('Password changed');
+      } catch (e) { showMsg(e.message, true); return false; }
+    },
+  });
+}
+
+function toggleUserMenu(evt) {
+  evt?.stopPropagation();
+  document.getElementById('user-menu').classList.toggle('open');
+}
+
+function closeUserMenu() {
+  document.getElementById('user-menu').classList.remove('open');
+}
+
+document.addEventListener('click', (e) => {
+  const menu = document.getElementById('user-menu');
+  if (menu.classList.contains('open') && !menu.contains(e.target)) closeUserMenu();
+});
+
+async function logout() {
+  await fetch('/logout', { method: 'POST' });
+  window.location.href = '/login';
+}
+
+// ── Groups ──────────────────────────────────────────────────────
+async function loadGroups() {
+  groups = await api('/api/admin/groups');
+  renderGroups();
+  renderGroupSelects();
+}
+
+function renderGroups() {
+  const list = document.getElementById('groups-list');
+  if (!groups.length) { list.innerHTML = '<div id="empty-hint">No groups yet</div>'; return; }
+  list.innerHTML = groups.map(g => `
+    <div class="card">
+      <div class="card-main">
+        <div class="card-title">
+          <span class="color-dot" style="background:${g.color || '#30363d'}"></span>
+          ${g.name}
+        </div>
+        <div class="card-sub">${g.codes.length ? 'codes: ' + g.codes.join(', ') : 'no codes mapped'} · ${g.member_count} member(s)</div>
+      </div>
+      <div class="row-actions">
+        <input type="color" value="${g.color || '#2563eb'}" title="Device color for this group"
+               onchange="updateGroupColor(${g.id}, this.value)">
+        <button class="btn" onclick="renameGroup(${g.id}, '${g.name.replace(/'/g, "\\'")}')">Rename</button>
+        <button class="btn danger" onclick="deleteGroup(${g.id})">Delete</button>
+      </div>
+    </div>`).join('');
+}
+
+async function updateGroupColor(id, color) {
+  try {
+    await api(`/api/admin/groups/${id}`, { method: 'PATCH', body: JSON.stringify({ color }) });
+    showMsg('Color updated');
+    await loadGroups();
+  } catch (e) { showMsg(e.message, true); }
+}
+
+function renderGroupSelects() {
+  const opts = groups.map(g => `<option value="${g.id}">${g.name}</option>`).join('');
+  document.getElementById('new-code-group').innerHTML = opts;
+  // Add-user's group <select> is now built fresh inside openAddUser()'s modal
+  // each time it opens, so it doesn't need to be kept in sync here.
+}
+
+async function createGroup(evt) {
+  evt.preventDefault();
+  const name = document.getElementById('new-group-name').value.trim();
+  const color = document.getElementById('new-group-color').value;
+  try {
+    await api('/api/admin/groups', { method: 'POST', body: JSON.stringify({ name, color }) });
+    document.getElementById('new-group-name').value = '';
+    showMsg(`Group "${name}" created`);
+    await Promise.all([loadGroups(), loadUsers()]);
+  } catch (e) { showMsg(e.message, true); }
+  return false;
+}
+
+function renameGroup(id, oldName) {
+  const safeOld = oldName.replace(/"/g, '&quot;');
+  openModal('Rename group', `
+    <label for="modal-group-name">Group name</label>
+    <input type="text" id="modal-group-name" value="${safeOld}">
+  `, {
+    confirmLabel: 'Save',
+    onConfirm: async () => {
+      const name = document.getElementById('modal-group-name').value.trim();
+      if (!name) { showMsg('Name is required', true); return false; }
+      if (name === oldName) return;
+      try {
+        await api(`/api/admin/groups/${id}`, { method: 'PATCH', body: JSON.stringify({ name }) });
+        showMsg('Group renamed');
+        await Promise.all([loadGroups(), loadUsers()]);
+      } catch (e) { showMsg(e.message, true); return false; }
+    },
+  });
+}
+
+function deleteGroup(id) {
+  openConfirm('Delete group', 'Delete this group? Its code mappings and member assignments will be removed too.', async () => {
+    try {
+      await api(`/api/admin/groups/${id}`, { method: 'DELETE' });
+      showMsg('Group deleted');
+      await Promise.all([loadGroups(), loadCodes(), loadUsers(), loadUnassigned()]);
+    } catch (e) { showMsg(e.message, true); return false; }
+  });
+}
+
+// ── Code mappings ─────────────────────────────────────────────────
+async function loadCodes() {
+  codes = await api('/api/admin/group_codes');
+  renderCodes();
+}
+
+function renderCodes() {
+  const list = document.getElementById('codes-list');
+  if (!codes.length) { list.innerHTML = '<div id="empty-hint">No code mappings yet — every device is Unassigned</div>'; return; }
+  list.innerHTML = codes.map(c => `
+    <div class="card">
+      <div class="card-main">
+        <div class="card-title">${c.code} → ${c.group_name}</div>
+      </div>
+      <div class="row-actions">
+        <button class="btn danger" onclick="deleteCode('${c.code}')">Delete</button>
+      </div>
+    </div>`).join('');
+}
+
+async function createCode(evt) {
+  evt.preventDefault();
+  const code = document.getElementById('new-code').value;
+  const group_id = Number(document.getElementById('new-code-group').value);
+  try {
+    await api('/api/admin/group_codes', { method: 'POST', body: JSON.stringify({ code, group_id }) });
+    document.getElementById('new-code').value = '';
+    showMsg(`Code "${code}" mapped`);
+    await Promise.all([loadCodes(), loadGroups(), loadUnassigned()]);
+  } catch (e) { showMsg(e.message, true); }
+  return false;
+}
+
+function deleteCode(code) {
+  openConfirm('Remove code mapping', `Remove mapping for code "${code}"? Matching devices become Unassigned.`, async () => {
+    try {
+      await api(`/api/admin/group_codes/${encodeURIComponent(code)}`, { method: 'DELETE' });
+      showMsg('Mapping removed');
+      await Promise.all([loadCodes(), loadGroups(), loadUnassigned()]);
+    } catch (e) { showMsg(e.message, true); return false; }
+  });
+}
+
+// ── Users ─────────────────────────────────────────────────────────
+async function loadUsers() {
+  users = await api('/api/admin/users');
+  renderUsers();
+}
+
+function renderUsers() {
+  const list = document.getElementById('users-list');
+  if (!users.length) { list.innerHTML = '<div id="empty-hint">No users yet</div>'; return; }
+  list.innerHTML = users.map(u => {
+    const fullName = [u.first_name, u.last_name].filter(Boolean).join(' ');
+    return `
+    <div class="card">
+      <div class="card-main">
+        <div class="card-title">${u.username} ${u.is_admin ? '<span class="chip admin">admin</span>' : ''}</div>
+        ${fullName ? `<div class="card-fullname">${escapeHtml(fullName)}</div>` : ''}
+        <div class="card-sub">
+          ${u.groups.length ? u.groups.map(g => `<span class="chip">${g.name}</span>`).join('') : 'no groups'}
+        </div>
+      </div>
+      <div class="row-actions">
+        <button class="btn" onclick="editUserName(${u.id})">Edit name</button>
+        <button class="btn" onclick="editUserGroups(${u.id})">Edit groups</button>
+        <button class="btn" onclick="toggleAdmin(${u.id}, ${u.is_admin})">${u.is_admin ? 'Revoke admin' : 'Make admin'}</button>
+        <button class="btn" onclick="resetPassword(${u.id})">Reset password</button>
+        <button class="btn danger" onclick="deleteUser(${u.id})">Delete</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function editUserName(id) {
+  const user = users.find(u => u.id === id);
+  openModal(`Edit name — ${user.username}`, `
+    <label for="modal-first-name">First name</label>
+    <input type="text" id="modal-first-name" value="${escapeHtml(user.first_name)}">
+    <label for="modal-last-name">Last name</label>
+    <input type="text" id="modal-last-name" value="${escapeHtml(user.last_name)}">
+  `, {
+    confirmLabel: 'Save',
+    onConfirm: async () => {
+      const first_name = document.getElementById('modal-first-name').value.trim();
+      const last_name = document.getElementById('modal-last-name').value.trim();
+      try {
+        await api(`/api/admin/users/${id}`, { method: 'PATCH', body: JSON.stringify({ first_name, last_name }) });
+        showMsg('Name updated');
+        await loadUsers();
+      } catch (e) { showMsg(e.message, true); return false; }
+    },
+  });
+}
+
+function openAddUser() {
+  const groupOpts = groups.map(g => `<option value="${g.id}">${g.name}</option>`).join('');
+  openModal('Add user', `
+    <label for="modal-new-username">Username</label>
+    <input type="text" id="modal-new-username">
+    <label for="modal-new-firstname">First name</label>
+    <input type="text" id="modal-new-firstname">
+    <label for="modal-new-lastname">Last name</label>
+    <input type="text" id="modal-new-lastname">
+    <label for="modal-new-password">Password</label>
+    <input type="password" id="modal-new-password" autocomplete="new-password">
+    <label style="display:flex;align-items:center;gap:6px;margin-top:12px;">
+      <input type="checkbox" id="modal-new-admin"> Admin
+    </label>
+    <label for="modal-new-groups">Groups</label>
+    <select id="modal-new-groups" class="groups-select" multiple>${groupOpts}</select>
+  `, {
+    confirmLabel: 'Add user',
+    onConfirm: async () => {
+      const username = document.getElementById('modal-new-username').value.trim();
+      const first_name = document.getElementById('modal-new-firstname').value.trim();
+      const last_name = document.getElementById('modal-new-lastname').value.trim();
+      const password = document.getElementById('modal-new-password').value;
+      const is_admin = document.getElementById('modal-new-admin').checked;
+      const group_ids = Array.from(document.getElementById('modal-new-groups').selectedOptions).map(o => Number(o.value));
+      if (!username || !password) { showMsg('Username and password are required', true); return false; }
+      try {
+        await api('/api/admin/users', {
+          method: 'POST',
+          body: JSON.stringify({ username, first_name, last_name, password, is_admin, group_ids }),
+        });
+        showMsg(`User "${username}" created`);
+        await loadUsers();
+      } catch (e) { showMsg(e.message, true); return false; }
+    },
+  });
+}
+
+function editUserGroups(id) {
+  const user = users.find(u => u.id === id);
+  const currentIds = new Set(user.groups.map(g => g.id));
+  const checklist = groups.length
+    ? groups.map(g => `
+        <div class="check-row">
+          <input type="checkbox" id="modal-group-${g.id}" value="${g.id}" ${currentIds.has(g.id) ? 'checked' : ''}>
+          <label for="modal-group-${g.id}" style="margin:0;color:#c9d1d9;font-size:.8rem;">${g.name}</label>
+        </div>`).join('')
+    : '<p style="color:#8b949e;">No groups exist yet — create one first.</p>';
+
+  openModal(`Edit groups — ${user.username}`, `<div class="modal-checklist">${checklist}</div>`, {
+    confirmLabel: 'Save',
+    onConfirm: async () => {
+      const group_ids = Array.from(document.querySelectorAll('#modal-body input[type="checkbox"]:checked'))
+        .map(el => Number(el.value));
+      try {
+        await api(`/api/admin/users/${id}`, { method: 'PATCH', body: JSON.stringify({ group_ids }) });
+        showMsg('Groups updated');
+        await loadUsers();
+      } catch (e) { showMsg(e.message, true); return false; }
+    },
+  });
+}
+
+async function toggleAdmin(id, isAdmin) {
+  try {
+    await api(`/api/admin/users/${id}`, { method: 'PATCH', body: JSON.stringify({ is_admin: !isAdmin }) });
+    showMsg('Updated');
+    await loadUsers();
+  } catch (e) { showMsg(e.message, true); }
+}
+
+function resetPassword(id) {
+  const user = users.find(u => u.id === id);
+  openModal(`Reset password — ${user.username}`, `
+    <label for="modal-password">New password</label>
+    <input type="password" id="modal-password" autocomplete="new-password">
+  `, {
+    confirmLabel: 'Reset',
+    onConfirm: async () => {
+      const password = document.getElementById('modal-password').value;
+      if (!password) { showMsg('Password is required', true); return false; }
+      try {
+        await api(`/api/admin/users/${id}/password`, { method: 'POST', body: JSON.stringify({ password }) });
+        showMsg('Password reset');
+      } catch (e) { showMsg(e.message, true); return false; }
+    },
+  });
+}
+
+function deleteUser(id) {
+  openConfirm('Delete user', 'Delete this user?', async () => {
+    try {
+      await api(`/api/admin/users/${id}`, { method: 'DELETE' });
+      showMsg('User deleted');
+      await loadUsers();
+    } catch (e) { showMsg(e.message, true); return false; }
+  });
+}
+
+// ── Unassigned devices ──────────────────────────────────────────────
+async function loadUnassigned() {
+  unassigned = await api('/api/admin/unassigned-devices');
+  renderUnassigned();
+}
+
+function renderUnassigned() {
+  const list = document.getElementById('unassigned-list');
+  if (!unassigned.length) { list.innerHTML = '<div id="empty-hint">No unassigned devices</div>'; return; }
+  list.innerHTML = unassigned.map(d => `
+    <div class="card">
+      <div class="card-main">
+        <div class="card-title">${d.name}</div>
+        <div class="card-sub">${d.uuid}</div>
+      </div>
+    </div>`).join('');
+}
+
+// ── Archived devices ─────────────────────────────────────────────────
+let archivedDevices = [];
+
+async function loadArchivedDevices() {
+  archivedDevices = await api('/api/devices?archived=1');
+  renderArchivedDevices();
+}
+
+function renderArchivedDevices() {
+  const list = document.getElementById('archived-list');
+  if (!archivedDevices.length) { list.innerHTML = '<div id="empty-hint">No archived devices</div>'; return; }
+  list.innerHTML = archivedDevices.map(d => `
+    <div class="card">
+      <div class="card-main">
+        <div class="card-title">${escapeHtml(d.name)}</div>
+        <div class="card-sub">${d.uuid} · ${d.fix_count} fixes</div>
+      </div>
+      <div class="row-actions">
+        <button class="btn" onclick="exportDeviceClick('${d.uuid}', '${d.name.replace(/'/g, "\\'")}')">Export</button>
+        <button class="btn danger" onclick="deleteDevicePermanently('${d.uuid}', '${d.name.replace(/'/g, "\\'")}')">Delete permanently</button>
+      </div>
+    </div>`).join('');
+}
+
+// Standalone export — a real browser download, available any time. Separate
+// from the server-side backup below, which only exists inside the
+// permanent-delete flow.
+async function exportDevice(uuid, name) {
+  const res = await fetch(`/api/admin/devices/${uuid}/export`);
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || `Export failed (${res.status})`);
+  }
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `${name || uuid}_backup.json`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+async function exportDeviceClick(uuid, name) {
+  try {
+    await exportDevice(uuid, name);
+    showMsg('Export downloaded');
+  } catch (e) { showMsg(e.message, true); }
+}
+
+function deleteDevicePermanently(uuid, name) {
+  openModal(`Delete "${name}" permanently`, `
+    <p>This permanently deletes all location history for this device. This cannot be undone.</p>
+    <label style="display:flex;align-items:center;gap:6px;margin-top:12px;">
+      <input type="checkbox" id="modal-backup-first" checked> Back up to server first
+    </label>
+    <p id="modal-backup-status" style="display:none;color:#3fb950;margin-top:10px;"></p>
+  `, {
+    confirmLabel: 'Delete permanently',
+    danger: true,
+    onConfirm: async () => {
+      let backupPath = null;
+      try {
+        if (document.getElementById('modal-backup-first').checked) {
+          const result = await api(`/api/admin/devices/${uuid}/backup`, { method: 'POST' });
+          backupPath = result.backup_path;
+          // Show the backup succeeded, right in the modal, before deleting —
+          // otherwise the two actions happen back to back and the backup
+          // step is never actually visible to the user.
+          const status = document.getElementById('modal-backup-status');
+          status.textContent = `✓ Backed up to ${backupPath}`;
+          status.style.display = 'block';
+          await new Promise(r => setTimeout(r, 900));
+        }
+        await api(`/api/admin/devices/${uuid}`, { method: 'DELETE' });
+        showMsg(backupPath ? `Backed up to ${backupPath} — "${name}" permanently deleted` : `"${name}" permanently deleted`);
+        await loadArchivedDevices();
+      } catch (e) { showMsg(e.message, true); return false; }
+    },
+  });
+}
+
+// ── Activity log ──────────────────────────────────────────────────────
+let auditLogRows = [];
+
+async function loadAuditLog() {
+  auditLogRows = await api('/api/admin/audit-log?limit=200');
+  populateAuditActionFilter();
+  renderAuditLog();
+}
+
+// Keeps the action dropdown in sync with whatever actions are actually
+// present in the loaded rows (rather than a hardcoded list that could drift
+// from the backend's real action names), while preserving the current
+// selection across reloads when it's still a valid option.
+function populateAuditActionFilter() {
+  const select = document.getElementById('audit-action-filter');
+  const current = select.value;
+  const actions = Array.from(new Set(auditLogRows.map(r => r.action))).sort();
+  select.innerHTML = '<option value="">All actions</option>' +
+    actions.map(a => `<option value="${a}">${a}</option>`).join('');
+  if (actions.includes(current)) select.value = current;
+}
+
+function renderAuditLog() {
+  const search = document.getElementById('audit-search').value.trim().toLowerCase();
+  const actionFilter = document.getElementById('audit-action-filter').value;
+  const rows = auditLogRows.filter(r => {
+    if (actionFilter && r.action !== actionFilter) return false;
+    if (!search) return true;
+    return [r.username, r.action, r.target, r.detail, r.ip]
+      .some(v => (v || '').toLowerCase().includes(search));
+  });
+
+  document.getElementById('audit-log-count').textContent =
+    auditLogRows.length ? `${rows.length} of ${auditLogRows.length}` : '';
+
+  const body = document.getElementById('audit-log-body');
+  if (!rows.length) {
+    body.innerHTML = `<tr><td colspan="6" id="empty-hint">${auditLogRows.length ? 'No matching activity' : 'No activity recorded yet'}</td></tr>`;
+    return;
+  }
+  body.innerHTML = rows.map(r => `
+    <tr${r.action === 'login_failed' ? ' class="audit-failed"' : ''}>
+      <td>${escapeHtml(r.ts)}</td>
+      <td>${escapeHtml(r.username || '—')}</td>
+      <td>${escapeHtml(r.action)}</td>
+      <td>${escapeHtml(r.target || '—')}</td>
+      <td class="detail-cell">${escapeHtml(r.detail || '')}</td>
+      <td>${escapeHtml(r.ip || '—')}</td>
+    </tr>`).join('');
+}
+
+// ── Settings ────────────────────────────────────────────────────────
+async function loadSettings() {
+  const settings = await api('/api/settings');
+  document.getElementById('device-notes-toggle').checked = settings.device_notes_enabled;
+}
+
+async function toggleDeviceNotes(enabled) {
+  try {
+    await api('/api/admin/settings', { method: 'PATCH', body: JSON.stringify({ device_notes_enabled: enabled }) });
+    showMsg(enabled ? 'Device notes enabled' : 'Device notes disabled');
+  } catch (e) {
+    showMsg(e.message, true);
+    document.getElementById('device-notes-toggle').checked = !enabled;  // revert on failure
+  }
+}
+
+// ── Bootstrap ─────────────────────────────────────────────────────
+async function loadAll() {
+  currentUser = await api('/api/me');
+  const fullName = [currentUser.first_name, currentUser.last_name].filter(Boolean).join(' ');
+  const displayName = fullName || currentUser.username;
+  const initial = (currentUser.first_name || currentUser.username || '?').charAt(0).toUpperCase();
+  document.getElementById('user-avatar').textContent = initial;
+  document.getElementById('user-menu-name').textContent = displayName;
+  document.getElementById('user-menu-fullname').textContent = displayName;
+  document.getElementById('user-menu-username').textContent = fullName ? `@${currentUser.username}` : '';
+  await Promise.all([loadSettings(), loadGroups(), loadCodes(), loadUsers(), loadUnassigned(), loadArchivedDevices(), loadAuditLog()]);
+}
+
+loadAll();
+</script>
+</body>
+</html>
