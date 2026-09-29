@@ -689,12 +689,23 @@ function reapplyHighlight() {
   highlightMarker = L.marker([pt.lat, pt.lon], { icon: markerIcon('#e3b341'), interactive: false }).addTo(map);
 }
 
+// Map-only: clicking a crumb dot selects that fix and zooms in close on it.
 function highlightFix(idx) {
   const track = allTracks.find(t => t.uuid === selectedDevice);
   const pt = track ? getVisiblePoints(track)[idx] : undefined;
   if (!pt) return;
   setHighlightedFix(idx);
   map.flyTo([pt.lat, pt.lon], 18, { duration: 0.6 });
+}
+
+// Log list: selects the row (same highlight as highlightFix) but zooms OUT
+// to the whole track instead of in on the single fix — the log list is for
+// picking a row to inspect while keeping the full-trail overview, map clicks
+// are for drilling into one specific point.
+function selectLogRow(idx) {
+  setHighlightedFix(idx);
+  const track = allTracks.find(t => t.uuid === selectedDevice);
+  if (track) fitToPoints(getVisiblePoints(track));
 }
 
 // ── Map rendering ─────────────────────────────────────────────────
@@ -723,7 +734,13 @@ function makeCrumbs(points, color) {
     return L.circleMarker([p.lat, p.lon], {
       radius: 2.5 + 1.5 * t, color, fillColor: color,
       fillOpacity: 0.12 + 0.55 * t, opacity: (0.12 + 0.55 * t) * 0.6, weight: 1
-    }).bindTooltip(p.timestamp || '—', { permanent: false, direction: 'top', className: 'crumb-tip' });
+    })
+      .bindTooltip(p.timestamp || '—', { permanent: false, direction: 'top', className: 'crumb-tip' })
+      // Clicking the dot is the only way to zoom into one specific fix — the
+      // log list intentionally does something different (selectLogRow(),
+      // zooms OUT to the whole track). Index matches getVisiblePoints(track),
+      // same array both this and the log list are built from.
+      .on('click', () => highlightFix(i));
   });
 }
 
@@ -943,7 +960,7 @@ function renderLog() {
 
   list.innerHTML = points.map((p, i) => {
     const isActive = i === highlightedIdx;
-    return `<div class="log-row${isActive ? ' active' : ''}" onclick="highlightFix(${i})">
+    return `<div class="log-row${isActive ? ' active' : ''}" onclick="selectLogRow(${i})">
       <div class="log-time">${p.timestamp || '—'}</div>
       <div class="log-meta">
         <span>${p.lat.toFixed(5)}, ${p.lon.toFixed(5)}</span>
