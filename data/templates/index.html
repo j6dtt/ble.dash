@@ -694,7 +694,7 @@ function highlightFix(idx) {
   const pt = track ? getVisiblePoints(track)[idx] : undefined;
   if (!pt) return;
   setHighlightedFix(idx);
-  map.panTo([pt.lat, pt.lon], { animate: true, duration: 0.4 });
+  map.flyTo([pt.lat, pt.lon], 18, { duration: 0.6 });
 }
 
 // ── Map rendering ─────────────────────────────────────────────────
