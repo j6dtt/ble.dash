@@ -26,6 +26,16 @@ DB_PATH = os.environ.get("DB_PATH", "tracks.db")
 BACKUP_DIR = os.path.join(os.path.dirname(DB_PATH) or ".", "backup")
 AUDIT_LOG_RETENTION_DAYS = int(os.environ.get("AUDIT_LOG_RETENTION_DAYS", 90))
 
+# Bump this whenever init_db() adds a table/column. Purely informational — the
+# actual migration logic below is what's safe/idempotent — but it gives a
+# one-line way to confirm a deploy landed (`docker logs` on startup, or query
+# app_settings) without manually diffing PRAGMA table_info() across instances.
+# 4 = current schema as of the private-device feature (device_meta.private +
+# device_users); this is where version tracking starts, not a full history.
+# 5 = super-admin override (users.is_super_admin) + private-device ownership
+# (device_meta.private_owner_id).
+SCHEMA_VERSION = 5
+
 
 def _load_or_create_secret_key() -> str:
     env_key = os.environ.get("SECRET_KEY")
@@ -52,7 +62,7 @@ app.config.update(
     PERMANENT_SESSION_LIFETIME=timedelta(hours=12),
 )
 
-_sse_clients: list[tuple] = []   # (queue.Queue, is_admin: bool, group_ids: frozenset[int])
+_sse_clients: list[tuple] = []   # (queue.Queue, is_super_admin: bool, is_admin: bool, group_ids: frozenset[int], private_uuids: frozenset[str])
 _sse_lock = threading.Lock()
 
 
@@ -94,6 +104,57 @@ def _visible_group_ids() -> list[int]:
             "SELECT group_id FROM user_groups WHERE user_id = ?", (session["user_id"],)
         ).fetchall()
     return [r[0] for r in rows]
+
+
+def _private_visible_uuids(user_id: int) -> list[str]:
+    """Uuids of private devices this specific user can see: either explicitly
+    granted (device_users) or the admin who currently owns it (private_owner_id
+    — whoever most recently set it private). Being an admin alone is NOT
+    enough; only the super admin bypasses this (see _visibility_sql())."""
+    with sqlite3.connect(DB_PATH) as con:
+        rows = con.execute("""
+            SELECT uuid FROM device_users WHERE user_id = ?
+            UNION
+            SELECT uuid FROM device_meta WHERE private = 1 AND private_owner_id = ?
+        """, (user_id, user_id)).fetchall()
+    return [r[0] for r in rows]
+
+
+def _private_uuids() -> set[str]:
+    """All uuids currently marked private, regardless of who can see them."""
+    with sqlite3.connect(DB_PATH) as con:
+        rows = con.execute("SELECT uuid FROM device_meta WHERE private = 1").fetchall()
+    return {r[0] for r in rows}
+
+
+def _visibility_sql() -> tuple[str, list]:
+    """SQL fragment + params implementing device visibility for the current
+    session, for queries that alias observations as o, groups as g, and
+    device_meta as m (true for both api_devices() and api_tracks()).
+
+    Three tiers:
+    - Super admin (the "admin" account only): empty fragment, sees everything.
+    - Regular admin: still sees every non-private device regardless of group
+      (unchanged admin group-bypass) — but for PRIVATE devices, being an
+      admin is no longer sufficient on its own; only ownership or an explicit
+      device_users grant does (same allowlist as members get).
+    - Member: non-private devices filtered by group membership; private
+      devices via the same owner-or-granted allowlist.
+
+    Private mode is an allowlist that *replaces* group visibility for that
+    device, not an addition on top of it, per the feature's own definition
+    ("only specific users can see them")."""
+    if session.get("is_super_admin"):
+        return "", []
+    private_uuids = _private_visible_uuids(session["user_id"])
+    private_clause = f"o.uuid IN ({','.join('?' * len(private_uuids))})" if private_uuids else "0=1"
+    if session.get("is_admin"):
+        clause = f" AND (COALESCE(m.private,0)=0 OR {private_clause})"
+        return clause, list(private_uuids)
+    group_ids = _visible_group_ids()
+    group_clause = f"g.id IN ({','.join('?' * len(group_ids))})" if group_ids else "0=1"
+    clause = f" AND ((COALESCE(m.private,0)=0 AND {group_clause}) OR (COALESCE(m.private,0)=1 AND {private_clause}))"
+    return clause, [*group_ids, *private_uuids]
 
 
 _HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
@@ -143,6 +204,10 @@ def init_db():
         existing_cols = {row[1] for row in con.execute("PRAGMA table_info(device_meta)")}
         if "notes" not in existing_cols:
             con.execute("ALTER TABLE device_meta ADD COLUMN notes TEXT")
+        if "private" not in existing_cols:
+            con.execute("ALTER TABLE device_meta ADD COLUMN private INTEGER NOT NULL DEFAULT 0")
+        if "private_owner_id" not in existing_cols:
+            con.execute("ALTER TABLE device_meta ADD COLUMN private_owner_id INTEGER REFERENCES users(id)")
         con.execute("""
             CREATE TABLE IF NOT EXISTS app_settings (
                 key   TEXT PRIMARY KEY,
@@ -163,6 +228,13 @@ def init_db():
             con.execute("ALTER TABLE users ADD COLUMN first_name TEXT")
         if "last_name" not in existing_user_cols:
             con.execute("ALTER TABLE users ADD COLUMN last_name TEXT")
+        if "is_super_admin" not in existing_user_cols:
+            con.execute("ALTER TABLE users ADD COLUMN is_super_admin INTEGER NOT NULL DEFAULT 0")
+        # The account literally named "admin" is always the super admin,
+        # regardless of when/how it was created — re-asserted every startup
+        # (not just on fresh installs) so this holds on existing deployments
+        # too, not just new ones bootstrapped after this column existed.
+        con.execute("UPDATE users SET is_super_admin = 1 WHERE username = 'admin'")
         con.execute("""
             CREATE TABLE IF NOT EXISTS groups (
                 id   INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -186,6 +258,13 @@ def init_db():
             )
         """)
         con.execute("""
+            CREATE TABLE IF NOT EXISTS device_users (
+                uuid    TEXT NOT NULL,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                PRIMARY KEY (uuid, user_id)
+            )
+        """)
+        con.execute("""
             CREATE TABLE IF NOT EXISTS audit_log (
                 id        INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts        TEXT NOT NULL DEFAULT (datetime('now')),
@@ -198,7 +277,12 @@ def init_db():
             )
         """)
         con.execute("CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts)")
+        con.execute("""
+            INSERT INTO app_settings (key, value) VALUES ('schema_version', ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """, (str(SCHEMA_VERSION),))
         con.commit()
+    logging.info("Schema version: %d", SCHEMA_VERSION)
 
 
 def bootstrap_admin():
@@ -287,16 +371,25 @@ def device_notes_enabled() -> bool:
 
 
 def _device_visible(uuid: str) -> bool:
-    """True if the current session user is allowed to see/annotate this device
-    (admin, or the device's derived group is one of the user's groups)."""
-    if session.get("is_admin"):
+    """True if the current session user is allowed to see/annotate this
+    device. Super admin: always. Private devices need an explicit
+    device_users grant or current ownership regardless of is_admin — same
+    rule as _visibility_sql(). Non-private devices: unconditionally visible
+    to (non-super) admins, or group-filtered for members."""
+    if session.get("is_super_admin"):
         return True
     with sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
         row = con.execute("SELECT name FROM observations WHERE uuid = ? LIMIT 1", (uuid,)).fetchone()
+        meta = con.execute("SELECT private FROM device_meta WHERE uuid = ?", (uuid,)).fetchone()
     if not row:
         return False
+    if meta and meta["private"]:
+        return uuid in set(_private_visible_uuids(session["user_id"]))
+    if session.get("is_admin"):
+        return True
     code_map = _code_to_group()
-    gid = _device_group_id(row[0], code_map)
+    gid = _device_group_id(row["name"], code_map)
     return gid is not None and gid in set(_visible_group_ids())
 
 
@@ -359,6 +452,7 @@ def notify_sse(obs_list: list[dict]):
             return
         code_map = _code_to_group()
         colors = _group_colors()
+        private_set = _private_uuids()
         # Stamp group_id/group_color onto each observation once, up front —
         # matches what /api/devices and /api/tracks already derive, so a
         # device first seen via a live push (rather than the initial page
@@ -368,10 +462,20 @@ def notify_sse(obs_list: list[dict]):
             gid = _device_group_id(o.get("name"), code_map)
             o["group_id"] = gid
             o["group_color"] = colors.get(gid)
+            o["private"] = o["uuid"] in private_set
         dead = []
         for client in _sse_clients:
-            q, is_admin, group_ids = client
-            visible = obs_list if is_admin else [o for o in obs_list if o["group_id"] in group_ids]
+            q, is_super_admin, is_admin, group_ids, private_uuids = client
+            if is_super_admin:
+                visible = obs_list
+            elif is_admin:
+                visible = [o for o in obs_list if not o["private"] or o["uuid"] in private_uuids]
+            else:
+                visible = [
+                    o for o in obs_list
+                    if (not o["private"] and o["group_id"] in group_ids)
+                    or (o["private"] and o["uuid"] in private_uuids)
+                ]
             if not visible:
                 continue
             if not _try_put(q, json.dumps(visible)):
@@ -452,7 +556,7 @@ def login():
     with sqlite3.connect(DB_PATH) as con:
         con.row_factory = sqlite3.Row
         user = con.execute(
-            "SELECT id, password_hash, is_admin FROM users WHERE username = ?",
+            "SELECT id, password_hash, is_admin, is_super_admin FROM users WHERE username = ?",
             (username,),
         ).fetchone()
 
@@ -466,6 +570,7 @@ def login():
     session["user_id"] = user["id"]
     session["username"] = username
     session["is_admin"] = bool(user["is_admin"])
+    session["is_super_admin"] = bool(user["is_super_admin"])
     log_activity("login")
 
     next_url = request.form.get("next") or ""
@@ -499,6 +604,7 @@ def api_me():
     return jsonify({
         "username": session["username"],
         "is_admin": bool(session["is_admin"]),
+        "is_super_admin": bool(session.get("is_super_admin")),
         "first_name": user["first_name"] if user else None,
         "last_name": user["last_name"] if user else None,
         "groups": [dict(g) for g in groups],
@@ -569,12 +675,11 @@ def update_device_notes(uuid):
 @login_required
 def api_devices():
     want_archived = request.args.get("archived") == "1"
-    is_admin = bool(session.get("is_admin"))
-    visible_group_ids = None if is_admin else _visible_group_ids()
 
     query = """
         SELECT o.uuid, o.name, o.lat, o.lon, o.obs_time AS last_seen,
                o.accuracy, o.confidence, cnt.fix_count, m.archived_at, m.notes,
+               COALESCE(m.private, 0) AS private,
                g.id AS group_id, COALESCE(g.name, 'Unassigned') AS group_name, g.color AS group_color
         FROM observations o
         INNER JOIN (
@@ -589,13 +694,9 @@ def api_devices():
         WHERE COALESCE(m.archived, 0) = ?
     """
     params = [1 if want_archived else 0]
-    if visible_group_ids is not None:
-        if visible_group_ids:
-            placeholders = ",".join("?" * len(visible_group_ids))
-            query += f" AND g.id IN ({placeholders})"
-            params.extend(visible_group_ids)
-        else:
-            query += " AND 0=1"   # member in zero groups sees nothing
+    clause, extra_params = _visibility_sql()
+    query += clause
+    params.extend(extra_params)
     query += " ORDER BY last_seen DESC"
 
     with sqlite3.connect(DB_PATH) as con:
@@ -635,9 +736,6 @@ def unarchive_device(uuid):
 @app.route("/api/tracks")
 @login_required
 def api_tracks():
-    is_admin = bool(session.get("is_admin"))
-    visible_group_ids = None if is_admin else _visible_group_ids()
-
     query = """
         SELECT o.uuid, o.name, o.lat, o.lon, o.obs_time, o.ingest_time, o.accuracy, o.confidence,
                g.id AS group_id, g.color AS group_color
@@ -648,13 +746,9 @@ def api_tracks():
         WHERE COALESCE(m.archived, 0) = 0
     """
     params = []
-    if visible_group_ids is not None:
-        if visible_group_ids:
-            placeholders = ",".join("?" * len(visible_group_ids))
-            query += f" AND g.id IN ({placeholders})"
-            params.extend(visible_group_ids)
-        else:
-            query += " AND 0=1"
+    clause, extra_params = _visibility_sql()
+    query += clause
+    params.extend(extra_params)
     query += " ORDER BY o.uuid, o.obs_time"
 
     with sqlite3.connect(DB_PATH) as con:
@@ -683,12 +777,14 @@ def api_tracks():
 @app.route("/stream")
 @login_required
 def stream():
+    is_super_admin = bool(session.get("is_super_admin"))
     is_admin = bool(session.get("is_admin"))
-    group_ids = frozenset() if is_admin else frozenset(_visible_group_ids())
+    group_ids = frozenset() if (is_super_admin or is_admin) else frozenset(_visible_group_ids())
+    private_uuids = frozenset() if is_super_admin else frozenset(_private_visible_uuids(session["user_id"]))
 
     q: queue.Queue = queue.Queue(maxsize=50)
     with _sse_lock:
-        _sse_clients.append((q, is_admin, group_ids))
+        _sse_clients.append((q, is_super_admin, is_admin, group_ids, private_uuids))
 
     def generate():
         try:
@@ -834,6 +930,7 @@ def admin_delete_user(user_id):
             if other_admins == 0:
                 return jsonify({"error": "cannot delete the last admin"}), 400
         con.execute("DELETE FROM user_groups WHERE user_id = ?", (user_id,))
+        con.execute("DELETE FROM device_users WHERE user_id = ?", (user_id,))
         con.execute("DELETE FROM users WHERE id = ?", (user_id,))
         con.commit()
     log_activity("user.delete", target=target[1] if target else str(user_id))
@@ -967,6 +1064,135 @@ def admin_unassigned_devices():
     return jsonify([dict(r) for r in rows])
 
 
+@app.route("/api/admin/devices")
+@admin_required
+def admin_devices():
+    """Currently-PRIVATE devices only — the compact list rendered by default
+    on the Management page's Device Access section. Deliberately not "every
+    device ever seen": with potentially hundreds of devices and only a
+    handful ever made private, loading/rendering the full catalog here
+    doesn't scale as a default view. Finding a device to newly mark private
+    goes through /api/admin/devices/search instead.
+
+    Restricted the same way as everywhere else: the super admin sees every
+    private device; a regular admin only sees ones they own or are
+    explicitly granted — being an admin no longer implies visibility into
+    every private device."""
+    is_super_admin = bool(session.get("is_super_admin"))
+    visible_uuids = None if is_super_admin else set(_private_visible_uuids(session["user_id"]))
+    with sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        rows = con.execute("""
+            SELECT DISTINCT o.uuid, o.name, COALESCE(m.archived, 0) AS archived,
+                   m.private_owner_id, u.username AS owner_username,
+                   g.id AS group_id, COALESCE(g.name, 'Unassigned') AS group_name
+            FROM observations o
+            JOIN device_meta m ON m.uuid = o.uuid AND m.private = 1
+            LEFT JOIN users u ON u.id = m.private_owner_id
+            LEFT JOIN group_codes gc ON gc.code = substr(o.name, 2, 1)
+            LEFT JOIN groups g ON g.id = gc.group_id
+            ORDER BY o.name
+        """).fetchall()
+        allowed_by_uuid: dict[str, list] = {}
+        for uuid, uid, username in con.execute("""
+            SELECT du.uuid, u.id, u.username FROM device_users du JOIN users u ON u.id = du.user_id
+        """).fetchall():
+            allowed_by_uuid.setdefault(uuid, []).append({"id": uid, "username": username})
+    if visible_uuids is not None:
+        rows = [r for r in rows if r["uuid"] in visible_uuids]
+    return jsonify([{
+        "uuid": r["uuid"], "name": r["name"], "archived": bool(r["archived"]),
+        "group_id": r["group_id"], "group_name": r["group_name"],
+        "owner_username": r["owner_username"],
+        "allowed_users": allowed_by_uuid.get(r["uuid"], []),
+    } for r in rows])
+
+
+@app.route("/api/admin/devices/search")
+@admin_required
+def admin_devices_search():
+    """Server-side device lookup for the "Make a device private" modal's
+    search-as-you-type — never ships the full device catalog to the browser
+    just to let an admin find one device among potentially hundreds.
+
+    A private device the requesting (non-super) admin doesn't own/isn't
+    granted is excluded entirely from results, not just flagged — matching
+    that they can't see it anywhere else either."""
+    q = (request.args.get("q") or "").strip()
+    if not q:
+        return jsonify([])
+    is_super_admin = bool(session.get("is_super_admin"))
+    visible_uuids = None if is_super_admin else set(_private_visible_uuids(session["user_id"]))
+    like = f"%{q}%"
+    with sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        rows = con.execute("""
+            SELECT DISTINCT o.uuid, o.name, COALESCE(m.private, 0) AS private,
+                   g.id AS group_id, COALESCE(g.name, 'Unassigned') AS group_name
+            FROM observations o
+            LEFT JOIN device_meta m ON m.uuid = o.uuid
+            LEFT JOIN group_codes gc ON gc.code = substr(o.name, 2, 1)
+            LEFT JOIN groups g ON g.id = gc.group_id
+            WHERE o.name LIKE ? OR o.uuid LIKE ?
+            ORDER BY o.name
+            LIMIT 20
+        """, (like, like)).fetchall()
+    if visible_uuids is not None:
+        rows = [r for r in rows if not r["private"] or r["uuid"] in visible_uuids]
+    return jsonify([{
+        "uuid": r["uuid"], "name": r["name"], "private": bool(r["private"]),
+        "group_id": r["group_id"], "group_name": r["group_name"],
+    } for r in rows])
+
+
+# Separate from delete_device_permanently()'s DELETE on the same path — this
+# is the non-destructive private/allowed-users toggle, admin-only like every
+# other device_meta mutation.
+@app.route("/api/admin/devices/<uuid>", methods=["PATCH"])
+@admin_required
+def admin_update_device(uuid):
+    data = request.get_json(force=True, silent=True) or {}
+    is_super_admin = bool(session.get("is_super_admin"))
+    with sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        meta = con.execute(
+            "SELECT private, private_owner_id FROM device_meta WHERE uuid = ?", (uuid,)
+        ).fetchone()
+        currently_private = bool(meta["private"]) if meta else False
+        owner_id = meta["private_owner_id"] if meta else None
+
+        # A currently-private device can only be touched (its access edited,
+        # or made public) by its owner or the super admin — being "just" an
+        # admin no longer grants this. A currently-public device can be
+        # privatized by any admin, who becomes its new owner.
+        if currently_private and not is_super_admin and owner_id != session["user_id"]:
+            return jsonify({"error": "only the admin who made this device private (or the super admin) can change its access"}), 403
+
+        changed = []
+        if "private" in data:
+            private = 1 if data["private"] else 0
+            if private:
+                con.execute("""
+                    INSERT INTO device_meta (uuid, private, private_owner_id) VALUES (?, 1, ?)
+                    ON CONFLICT(uuid) DO UPDATE SET private = 1, private_owner_id = excluded.private_owner_id
+                """, (uuid, session["user_id"]))
+            else:
+                con.execute("""
+                    INSERT INTO device_meta (uuid, private) VALUES (?, 0)
+                    ON CONFLICT(uuid) DO UPDATE SET private = 0
+                """, (uuid,))
+            changed.append(f"private={bool(private)}")
+        if "user_ids" in data:
+            user_ids = data["user_ids"] or []
+            con.execute("DELETE FROM device_users WHERE uuid = ?", (uuid,))
+            for uid in user_ids:
+                con.execute("INSERT OR IGNORE INTO device_users (uuid, user_id) VALUES (?, ?)", (uuid, uid))
+            changed.append(f"user_ids={user_ids}")
+        con.commit()
+    log_activity("device.access_update", target=uuid, detail="; ".join(changed))
+    return jsonify({"ok": True})
+
+
 @app.route("/api/admin/audit-log")
 @admin_required
 def admin_audit_log():
@@ -1051,6 +1277,7 @@ def delete_device_permanently(uuid):
             return jsonify({"error": "device must be archived before it can be permanently deleted"}), 400
         con.execute("DELETE FROM observations WHERE uuid = ?", (uuid,))
         con.execute("DELETE FROM device_meta WHERE uuid = ?", (uuid,))
+        con.execute("DELETE FROM device_users WHERE uuid = ?", (uuid,))
         con.commit()
     log_activity("device.delete", target=uuid)
     return jsonify({"uuid": uuid, "deleted": True})

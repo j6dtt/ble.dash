@@ -101,6 +101,7 @@ section h2 {
   border-radius: 10px; padding: 1px 8px; margin: 2px 3px 0 0; color: #c9d1d9;
 }
 .chip.admin { border-color: #e3b341; color: #e3b341; }
+.chip.private { border-color: #f85149; color: #f85149; }
 .row-actions { display: flex; gap: 6px; flex-shrink: 0; }
 .btn {
   height: 26px; padding: 0 10px; border-radius: 4px; background: #21262d;
@@ -295,6 +296,17 @@ input[type="color"] {
   <section>
     <h2>Unassigned Devices</h2>
     <div id="unassigned-list"></div>
+  </section>
+
+  <section>
+    <div class="section-header">
+      <h2>Device Access</h2>
+      <button class="btn-primary" onclick="openMakePrivate()">+ Make a device private</button>
+    </div>
+    <div id="device-access-hint" class="setting-hint" style="margin-bottom:8px;">
+      Private devices are hidden from everyone except admins and the specific users granted access below — this overrides group visibility for that device. Only devices already made private are listed here; use the button above to find and privatize another one.
+    </div>
+    <div id="device-access-list"></div>
   </section>
 
   <section>
@@ -493,7 +505,7 @@ async function createGroup(evt) {
     await api('/api/admin/groups', { method: 'POST', body: JSON.stringify({ name, color }) });
     document.getElementById('new-group-name').value = '';
     showMsg(`Group "${name}" created`);
-    await Promise.all([loadGroups(), loadUsers()]);
+    await Promise.all([loadGroups(), loadUsers(), loadPrivateDevices()]);
   } catch (e) { showMsg(e.message, true); }
   return false;
 }
@@ -512,7 +524,7 @@ function renameGroup(id, oldName) {
       try {
         await api(`/api/admin/groups/${id}`, { method: 'PATCH', body: JSON.stringify({ name }) });
         showMsg('Group renamed');
-        await Promise.all([loadGroups(), loadUsers()]);
+        await Promise.all([loadGroups(), loadUsers(), loadPrivateDevices()]);
       } catch (e) { showMsg(e.message, true); return false; }
     },
   });
@@ -523,7 +535,7 @@ function deleteGroup(id) {
     try {
       await api(`/api/admin/groups/${id}`, { method: 'DELETE' });
       showMsg('Group deleted');
-      await Promise.all([loadGroups(), loadCodes(), loadUsers(), loadUnassigned()]);
+      await Promise.all([loadGroups(), loadCodes(), loadUsers(), loadUnassigned(), loadPrivateDevices()]);
     } catch (e) { showMsg(e.message, true); return false; }
   });
 }
@@ -556,7 +568,7 @@ async function createCode(evt) {
     await api('/api/admin/group_codes', { method: 'POST', body: JSON.stringify({ code, group_id }) });
     document.getElementById('new-code').value = '';
     showMsg(`Code "${code}" mapped`);
-    await Promise.all([loadCodes(), loadGroups(), loadUnassigned()]);
+    await Promise.all([loadCodes(), loadGroups(), loadUnassigned(), loadPrivateDevices()]);
   } catch (e) { showMsg(e.message, true); }
   return false;
 }
@@ -566,7 +578,7 @@ function deleteCode(code) {
     try {
       await api(`/api/admin/group_codes/${encodeURIComponent(code)}`, { method: 'DELETE' });
       showMsg('Mapping removed');
-      await Promise.all([loadCodes(), loadGroups(), loadUnassigned()]);
+      await Promise.all([loadCodes(), loadGroups(), loadUnassigned(), loadPrivateDevices()]);
     } catch (e) { showMsg(e.message, true); return false; }
   });
 }
@@ -717,7 +729,7 @@ function deleteUser(id) {
     try {
       await api(`/api/admin/users/${id}`, { method: 'DELETE' });
       showMsg('User deleted');
-      await loadUsers();
+      await Promise.all([loadUsers(), loadPrivateDevices()]);
     } catch (e) { showMsg(e.message, true); return false; }
   });
 }
@@ -738,6 +750,155 @@ function renderUnassigned() {
         <div class="card-sub">${d.uuid}</div>
       </div>
     </div>`).join('');
+}
+
+// ── Device access (private mode) ─────────────────────────────────────
+// Private mode is an allowlist that REPLACES group visibility for that one
+// device, not an addition to it — a device with private=1 is invisible to
+// everyone except admins and whoever is in its allowed_users list, even if
+// they'd normally see it via their group.
+//
+// The list below only ever shows devices ALREADY private (typically a
+// handful) — with potentially hundreds of devices total, rendering every
+// one with a toggle doesn't scale. Making a NEW device private goes through
+// a search-driven modal (openMakePrivate()) instead of scrolling a giant list.
+let privateDevices = [];
+
+async function loadPrivateDevices() {
+  privateDevices = await api('/api/admin/devices');
+  renderPrivateDevices();
+}
+
+function renderPrivateDevices() {
+  const list = document.getElementById('device-access-list');
+  if (!privateDevices.length) {
+    list.innerHTML = '<div id="empty-hint">No private devices — every device is visible per normal group rules.</div>';
+    return;
+  }
+  list.innerHTML = privateDevices.map(d => {
+    const allowedNames = d.allowed_users.map(u => escapeHtml(u.username)).join(', ');
+    // Only the owner or the super admin can actually edit/make-public this
+    // entry (server-enforced too — this just avoids showing buttons that
+    // would 403) — a device the viewer merely sees via a device_users grant,
+    // without owning it, still shows read-only.
+    const canManage = currentUser?.is_super_admin || currentUser?.username === d.owner_username;
+    return `
+    <div class="card">
+      <div class="card-main">
+        <div class="card-title">
+          ${escapeHtml(d.name)}
+          ${d.archived ? '<span class="chip">archived</span>' : ''}
+        </div>
+        <div class="card-sub">${d.uuid} · ${escapeHtml(d.group_name)}</div>
+        <div class="card-sub">Owned by: ${escapeHtml(d.owner_username || 'unknown')}</div>
+        <div class="card-sub">Allowed: ${allowedNames || 'no one yet'}</div>
+      </div>
+      <div class="row-actions">
+        ${canManage ? `
+          <button class="btn" onclick="editDeviceAccess('${d.uuid}', '${d.name.replace(/'/g, "\\'")}')">Edit</button>
+          <button class="btn danger" onclick="makeDevicePublic('${d.uuid}', '${d.name.replace(/'/g, "\\'")}')">Make public</button>
+        ` : '<span class="setting-hint">Managed by owner</span>'}
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function makeDevicePublic(uuid, name) {
+  openConfirm('Make public', `Make "${escapeHtml(name)}" visible per normal group rules again? Its allowed-user list is kept (not deleted) in case you make it private again later.`, async () => {
+    try {
+      await api(`/api/admin/devices/${uuid}`, { method: 'PATCH', body: JSON.stringify({ private: false }) });
+      showMsg(`"${name}" is now public`);
+      await loadPrivateDevices();
+    } catch (e) { showMsg(e.message, true); return false; }
+  });
+}
+
+function editDeviceAccess(uuid, name) {
+  const device = privateDevices.find(d => d.uuid === uuid);
+  const currentIds = device ? device.allowed_users.map(u => u.id) : [];
+  openDeviceAccessChecklist(uuid, name, currentIds, false);
+}
+
+// Shared step-2 UI for both "Edit" (existing private device) and the second
+// step of "Make a device private" (markPrivate=true also flips private=1).
+function openDeviceAccessChecklist(uuid, name, currentUserIds, markPrivate) {
+  const currentIds = new Set(currentUserIds);
+  const checklist = users.length
+    ? users.map(u => `
+        <div class="check-row">
+          <input type="checkbox" id="modal-devuser-${u.id}" value="${u.id}" ${currentIds.has(u.id) ? 'checked' : ''}>
+          <label for="modal-devuser-${u.id}" style="margin:0;color:#c9d1d9;font-size:.8rem;">${escapeHtml(u.username)}</label>
+        </div>`).join('')
+    : '<p style="color:#8b949e;">No users exist yet — create one first.</p>';
+
+  openModal(`Device access — ${escapeHtml(name)}`, `<div class="modal-checklist">${checklist}</div>`, {
+    confirmLabel: 'Save',
+    onConfirm: async () => {
+      const user_ids = Array.from(document.querySelectorAll('#modal-body input[type="checkbox"]:checked'))
+        .map(el => Number(el.value));
+      const body = markPrivate ? { private: true, user_ids } : { user_ids };
+      try {
+        await api(`/api/admin/devices/${uuid}`, { method: 'PATCH', body: JSON.stringify(body) });
+        showMsg(markPrivate ? `"${name}" is now private` : 'Device access updated');
+        await loadPrivateDevices();
+      } catch (e) { showMsg(e.message, true); return false; }
+    },
+  });
+}
+
+// ── Make a device private (search-driven, step 1) ────────────────────
+// Never loads the full device catalog — searches server-side as you type,
+// so this scales the same whether there are 10 devices or 10,000.
+let makePrivateSelected = null;
+let deviceSearchTimer = null;
+
+function openMakePrivate() {
+  makePrivateSelected = null;
+  openModal('Make a device private', `
+    <label for="modal-device-search">Search by name or uuid</label>
+    <input type="text" id="modal-device-search" oninput="runDeviceSearch(this.value)" autocomplete="off" placeholder="Start typing…">
+    <div id="modal-device-results" class="modal-checklist" style="margin-top:8px; display:none;"></div>
+  `, {
+    confirmLabel: 'Next',
+    onConfirm: () => {
+      if (!makePrivateSelected) { showMsg('Pick a device first', true); return false; }
+      const { uuid, name, isPrivate } = makePrivateSelected;
+      const existing = isPrivate
+        ? (privateDevices.find(d => d.uuid === uuid)?.allowed_users.map(u => u.id) || [])
+        : [];
+      openDeviceAccessChecklist(uuid, name, existing, true);
+      return false;   // openDeviceAccessChecklist() re-opens the modal itself for step 2
+    },
+  });
+}
+
+async function runDeviceSearch(q) {
+  clearTimeout(deviceSearchTimer);
+  const box = document.getElementById('modal-device-results');
+  makePrivateSelected = null;
+  if (!q.trim()) { box.style.display = 'none'; box.innerHTML = ''; return; }
+  deviceSearchTimer = setTimeout(async () => {
+    let results;
+    try {
+      results = await api(`/api/admin/devices/search?q=${encodeURIComponent(q.trim())}`);
+    } catch (e) { showMsg(e.message, true); return; }
+    box.innerHTML = results.length
+      ? results.map(d => `
+          <div class="check-row" style="cursor:pointer;" onclick="pickDeviceForPrivate('${d.uuid}', '${d.name.replace(/'/g, "\\'")}', ${d.private})">
+            <span style="color:#c9d1d9;font-size:.8rem;">
+              ${escapeHtml(d.name)}${d.private ? ' <span class="chip private">already private</span>' : ''}
+              <span style="color:#8b949e;">· ${escapeHtml(d.group_name)}</span>
+            </span>
+          </div>`).join('')
+      : '<p style="color:#8b949e;margin:0;">No matching devices</p>';
+    box.style.display = 'block';
+  }, 250);
+}
+
+function pickDeviceForPrivate(uuid, name, isPrivate) {
+  makePrivateSelected = { uuid, name, isPrivate };
+  document.getElementById('modal-device-search').value = name;
+  document.getElementById('modal-device-results').style.display = 'none';
 }
 
 // ── Archived devices ─────────────────────────────────────────────────
@@ -900,7 +1061,7 @@ async function loadAll() {
   document.getElementById('user-menu-name').textContent = displayName;
   document.getElementById('user-menu-fullname').textContent = displayName;
   document.getElementById('user-menu-username').textContent = fullName ? `@${currentUser.username}` : '';
-  await Promise.all([loadSettings(), loadGroups(), loadCodes(), loadUsers(), loadUnassigned(), loadArchivedDevices(), loadAuditLog()]);
+  await Promise.all([loadSettings(), loadGroups(), loadCodes(), loadUsers(), loadUnassigned(), loadPrivateDevices(), loadArchivedDevices(), loadAuditLog()]);
 }
 
 loadAll();

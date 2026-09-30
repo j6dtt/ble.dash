@@ -194,6 +194,7 @@ html, body { height: 100%; font-family: 'Segoe UI', sans-serif; background: #0d1
 }
 .card-name  { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: .9rem; }
 .dot        { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+.card-private { flex-shrink: 0; font-size: .78rem; line-height: 1; }
 .card-archive {
   margin-left: auto; flex-shrink: 0; width: 22px; height: 22px;
   background: none; border: 1px solid #30363d; border-radius: 3px;
@@ -808,6 +809,7 @@ function deviceCardHtml(d) {
         onclick="event.stopPropagation()" onchange="toggleDeviceFilter('${d.uuid}')" title="Show/hide this device">
       <div class="dot" style="background:${color}"></div>
       ${d.name}
+      ${d.private ? '<span class="card-private" title="Private device — visible only to specifically granted users">🔒</span>' : ''}
       ${currentUser?.is_admin ? `<button class="card-archive" onclick="archiveDevice(event,'${d.uuid}')" title="Archive device">🗄</button>` : ''}
     </div>
     <div class="card-uuid">${d.uuid}</div>
