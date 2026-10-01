@@ -110,6 +110,21 @@ section h2 {
 .btn:hover { border-color: #58a6ff; color: #58a6ff; }
 .btn.danger:hover { border-color: #f85149; color: #f85149; }
 #empty-hint { color: #8b949e; font-size: .8rem; padding: 10px 0; }
+#version-info { text-align: center; color: #6e7681; font-size: .68rem; margin-top: 20px; }
+
+/* Reusable search(+filter) bar, used above Users / Unassigned Devices /
+   Archived Devices so a long list stays navigable instead of one flat dump. */
+.list-controls { display: flex; gap: 8px; margin-bottom: 8px; }
+.list-search {
+  flex: 1; min-width: 160px; height: 30px; padding: 0 8px; background: #0d1117;
+  border: 1px solid #30363d; border-radius: 4px; color: #c9d1d9; font-size: .78rem; outline: none;
+}
+.list-search:focus { border-color: #58a6ff; }
+.list-filter {
+  height: 30px; padding: 0 8px; background: #0d1117; border: 1px solid #30363d;
+  border-radius: 4px; color: #c9d1d9; font-size: .78rem; outline: none;
+}
+.list-filter:focus { border-color: #58a6ff; }
 
 #audit-log-controls { display: flex; gap: 8px; margin-bottom: 8px; }
 #audit-search {
@@ -177,7 +192,13 @@ input[type="color"] {
   width: 380px; max-width: 90vw; background: #161b22; border: 1px solid #30363d;
   border-radius: 8px; padding: 20px; box-shadow: 0 8px 30px rgba(0,0,0,.5);
 }
-.modal-title { font-size: .92rem; font-weight: 600; color: #58a6ff; margin-bottom: 14px; }
+.modal-header { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 14px; }
+.modal-title { font-size: .92rem; font-weight: 600; color: #58a6ff; }
+.modal-close-x {
+  flex-shrink: 0; width: 24px; height: 24px; padding: 0; background: none; border: none;
+  color: #8b949e; font-size: 1rem; line-height: 1; cursor: pointer; border-radius: 4px;
+}
+.modal-close-x:hover { color: #c9d1d9; background: #21262d; }
 .modal-body { font-size: .82rem; color: #c9d1d9; margin-bottom: 18px; }
 .modal-body p { line-height: 1.5; }
 .modal-body label {
@@ -197,23 +218,7 @@ input[type="color"] {
 .modal-actions .btn.primary { border-color: #58a6ff; color: #58a6ff; }
 .modal-actions .btn.danger  { border-color: #f85149; color: #f85149; }
 
-.setting-row {
-  display: flex; align-items: center; justify-content: space-between; gap: 14px;
-  background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 12px 14px;
-}
-.setting-label { font-size: .85rem; }
 .setting-hint { font-size: .72rem; color: #8b949e; margin-top: 2px; }
-.toggle { position: relative; display: inline-block; width: 40px; height: 22px; flex-shrink: 0; }
-.toggle input { opacity: 0; width: 0; height: 0; }
-.toggle-track {
-  position: absolute; inset: 0; background: #30363d; border-radius: 22px; cursor: pointer; transition: background .15s;
-}
-.toggle-track::before {
-  content: ""; position: absolute; width: 16px; height: 16px; left: 3px; top: 3px;
-  background: #c9d1d9; border-radius: 50%; transition: transform .15s;
-}
-.toggle input:checked + .toggle-track { background: #238636; }
-.toggle input:checked + .toggle-track::before { transform: translateX(18px); background: #fff; }
 </style>
 </head>
 <body>
@@ -252,20 +257,6 @@ input[type="color"] {
   <div id="msg"></div>
 
   <section>
-    <h2>Settings</h2>
-    <div class="setting-row">
-      <div>
-        <div class="setting-label">Device notes</div>
-        <div class="setting-hint">Let any user (not just admins) add a friendly name / note on a device card.</div>
-      </div>
-      <label class="toggle">
-        <input type="checkbox" id="device-notes-toggle" onchange="toggleDeviceNotes(this.checked)">
-        <span class="toggle-track"></span>
-      </label>
-    </div>
-  </section>
-
-  <section>
     <h2>Groups</h2>
     <div id="groups-list"></div>
     <form class="inline-form" onsubmit="return createGroup(event)">
@@ -290,11 +281,22 @@ input[type="color"] {
       <h2>Users</h2>
       <button class="btn-primary" onclick="openAddUser()">+ Add user</button>
     </div>
+    <div class="list-controls">
+      <input type="text" id="users-search" class="list-search" placeholder="Search users…" oninput="renderUsers()">
+      <select id="users-role-filter" class="list-filter" onchange="renderUsers()">
+        <option value="">All roles</option>
+        <option value="admin">Admins</option>
+        <option value="member">Members</option>
+      </select>
+    </div>
     <div id="users-list"></div>
   </section>
 
   <section>
     <h2>Unassigned Devices</h2>
+    <div class="list-controls">
+      <input type="text" id="unassigned-search" class="list-search" placeholder="Search devices…" oninput="renderUnassigned()">
+    </div>
     <div id="unassigned-list"></div>
   </section>
 
@@ -313,6 +315,9 @@ input[type="color"] {
     <h2>Archived Devices</h2>
     <div id="archived-hint" class="setting-hint" style="margin-bottom:8px;">
       Permanent deletion is only available for archived devices. Archive a device from the dashboard first.
+    </div>
+    <div class="list-controls">
+      <input type="text" id="archived-search" class="list-search" placeholder="Search archived devices…" oninput="renderArchivedDevices()">
     </div>
     <div id="archived-list"></div>
   </section>
@@ -337,14 +342,18 @@ input[type="color"] {
       </table>
     </div>
   </section>
+
+  <div id="version-info"></div>
 </div>
 
 <div id="modal-backdrop" class="modal-backdrop" style="display:none;" onclick="if (event.target === this) closeModal()">
   <div class="modal">
-    <div class="modal-title" id="modal-title"></div>
+    <div class="modal-header">
+      <div class="modal-title" id="modal-title"></div>
+      <button class="modal-close-x" onclick="closeModal()" aria-label="Close" title="Close">✕</button>
+    </div>
     <div class="modal-body" id="modal-body"></div>
     <div class="modal-actions">
-      <button class="btn" onclick="closeModal()">Cancel</button>
       <button class="btn primary" id="modal-confirm-btn"></button>
     </div>
   </div>
@@ -592,23 +601,50 @@ async function loadUsers() {
 function renderUsers() {
   const list = document.getElementById('users-list');
   if (!users.length) { list.innerHTML = '<div id="empty-hint">No users yet</div>'; return; }
-  list.innerHTML = users.map(u => {
+
+  const search = (document.getElementById('users-search')?.value || '').trim().toLowerCase();
+  const roleFilter = document.getElementById('users-role-filter')?.value || '';
+  const filtered = users.filter(u => {
+    if (roleFilter === 'admin' && !u.is_admin) return false;
+    if (roleFilter === 'member' && u.is_admin) return false;
+    if (!search) return true;
+    const fullName = [u.first_name, u.last_name].filter(Boolean).join(' ').toLowerCase();
+    return u.username.toLowerCase().includes(search) || fullName.includes(search);
+  });
+  if (!filtered.length) { list.innerHTML = '<div id="empty-hint">No matching users</div>'; return; }
+
+  list.innerHTML = filtered.map(u => {
     const fullName = [u.first_name, u.last_name].filter(Boolean).join(' ');
+    // The super admin account can only be modified by itself — server-enforced
+    // (403 either way), this just avoids showing buttons that would just fail.
+    const protectedFromMe = u.is_super_admin && currentUser?.id !== u.id;
+    // Even viewing their OWN row, the super admin shouldn't see "Revoke admin"
+    // or "Delete": admin_required checks is_admin (not is_super_admin), so
+    // self-revoking would lock them out of Management entirely, and deleting
+    // "admin" while other admins exist permanently loses the super-admin role
+    // (bootstrap_admin() only re-seeds when ZERO admins remain). Both are
+    // also hard-blocked server-side — this is just not offering a footgun.
+    const isSelfSuperAdmin = u.is_super_admin && currentUser?.id === u.id;
     return `
     <div class="card">
       <div class="card-main">
-        <div class="card-title">${u.username} ${u.is_admin ? '<span class="chip admin">admin</span>' : ''}</div>
+        <div class="card-title">
+          ${u.username}
+          ${u.is_super_admin ? '<span class="chip private">super admin</span>' : (u.is_admin ? '<span class="chip admin">admin</span>' : '')}
+        </div>
         ${fullName ? `<div class="card-fullname">${escapeHtml(fullName)}</div>` : ''}
         <div class="card-sub">
           ${u.groups.length ? u.groups.map(g => `<span class="chip">${g.name}</span>`).join('') : 'no groups'}
         </div>
       </div>
       <div class="row-actions">
-        <button class="btn" onclick="editUserName(${u.id})">Edit name</button>
-        <button class="btn" onclick="editUserGroups(${u.id})">Edit groups</button>
-        <button class="btn" onclick="toggleAdmin(${u.id}, ${u.is_admin})">${u.is_admin ? 'Revoke admin' : 'Make admin'}</button>
-        <button class="btn" onclick="resetPassword(${u.id})">Reset password</button>
-        <button class="btn danger" onclick="deleteUser(${u.id})">Delete</button>
+        ${protectedFromMe ? '<span class="setting-hint">Only this account can modify itself</span>' : `
+          <button class="btn" onclick="editUserName(${u.id})">Edit name</button>
+          <button class="btn" onclick="editUserGroups(${u.id})">Edit groups</button>
+          ${isSelfSuperAdmin ? '' : `<button class="btn" onclick="toggleAdmin(${u.id}, ${u.is_admin})">${u.is_admin ? 'Revoke admin' : 'Make admin'}</button>`}
+          <button class="btn" onclick="resetPassword(${u.id})">Reset password</button>
+          ${isSelfSuperAdmin ? '' : `<button class="btn danger" onclick="deleteUser(${u.id})">Delete</button>`}
+        `}
       </div>
     </div>`;
   }).join('');
@@ -743,7 +779,14 @@ async function loadUnassigned() {
 function renderUnassigned() {
   const list = document.getElementById('unassigned-list');
   if (!unassigned.length) { list.innerHTML = '<div id="empty-hint">No unassigned devices</div>'; return; }
-  list.innerHTML = unassigned.map(d => `
+
+  const search = (document.getElementById('unassigned-search')?.value || '').trim().toLowerCase();
+  const filtered = search
+    ? unassigned.filter(d => d.name.toLowerCase().includes(search) || d.uuid.toLowerCase().includes(search))
+    : unassigned;
+  if (!filtered.length) { list.innerHTML = '<div id="empty-hint">No matching devices</div>'; return; }
+
+  list.innerHTML = filtered.map(d => `
     <div class="card">
       <div class="card-main">
         <div class="card-title">${d.name}</div>
@@ -912,7 +955,14 @@ async function loadArchivedDevices() {
 function renderArchivedDevices() {
   const list = document.getElementById('archived-list');
   if (!archivedDevices.length) { list.innerHTML = '<div id="empty-hint">No archived devices</div>'; return; }
-  list.innerHTML = archivedDevices.map(d => `
+
+  const search = (document.getElementById('archived-search')?.value || '').trim().toLowerCase();
+  const filtered = search
+    ? archivedDevices.filter(d => d.name.toLowerCase().includes(search) || d.uuid.toLowerCase().includes(search))
+    : archivedDevices;
+  if (!filtered.length) { list.innerHTML = '<div id="empty-hint">No matching devices</div>'; return; }
+
+  list.innerHTML = filtered.map(d => `
     <div class="card">
       <div class="card-main">
         <div class="card-title">${escapeHtml(d.name)}</div>
@@ -1035,22 +1085,6 @@ function renderAuditLog() {
     </tr>`).join('');
 }
 
-// ── Settings ────────────────────────────────────────────────────────
-async function loadSettings() {
-  const settings = await api('/api/settings');
-  document.getElementById('device-notes-toggle').checked = settings.device_notes_enabled;
-}
-
-async function toggleDeviceNotes(enabled) {
-  try {
-    await api('/api/admin/settings', { method: 'PATCH', body: JSON.stringify({ device_notes_enabled: enabled }) });
-    showMsg(enabled ? 'Device notes enabled' : 'Device notes disabled');
-  } catch (e) {
-    showMsg(e.message, true);
-    document.getElementById('device-notes-toggle').checked = !enabled;  // revert on failure
-  }
-}
-
 // ── Bootstrap ─────────────────────────────────────────────────────
 async function loadAll() {
   currentUser = await api('/api/me');
@@ -1061,7 +1095,14 @@ async function loadAll() {
   document.getElementById('user-menu-name').textContent = displayName;
   document.getElementById('user-menu-fullname').textContent = displayName;
   document.getElementById('user-menu-username').textContent = fullName ? `@${currentUser.username}` : '';
-  await Promise.all([loadSettings(), loadGroups(), loadCodes(), loadUsers(), loadUnassigned(), loadPrivateDevices(), loadArchivedDevices(), loadAuditLog()]);
+  await Promise.all([loadGroups(), loadCodes(), loadUsers(), loadUnassigned(), loadPrivateDevices(), loadArchivedDevices(), loadAuditLog(), loadVersion()]);
+}
+
+async function loadVersion() {
+  try {
+    const v = await api('/api/admin/version');
+    document.getElementById('version-info').textContent = `App v${v.app_version} · Schema v${v.schema_version}`;
+  } catch (e) { /* non-critical — leave blank on failure */ }
 }
 
 loadAll();

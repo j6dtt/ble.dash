@@ -26,6 +26,15 @@ DB_PATH = os.environ.get("DB_PATH", "tracks.db")
 BACKUP_DIR = os.path.join(os.path.dirname(DB_PATH) or ".", "backup")
 AUDIT_LOG_RETENTION_DAYS = int(os.environ.get("AUDIT_LOG_RETENTION_DAYS", 90))
 
+# Basemap: OpenStreetMap raster tiles by default (works anywhere, no internal
+# network required — this is what dev uses). If BASEMAP_WMS_URL is set, the
+# frontend switches to an NGA WMS layer instead (what prod uses, on a network
+# that can actually reach it) — switching environments is then just one env
+# var + `docker compose up -d`, never a code/template edit.
+BASEMAP_WMS_URL = os.environ.get("BASEMAP_WMS_URL", "")
+BASEMAP_WMS_LAYERS = os.environ.get("BASEMAP_WMS_LAYERS", "OSM_BASEMAP")
+BASEMAP_ATTRIBUTION = os.environ.get("BASEMAP_ATTRIBUTION", "NGA OSM")
+
 # Bump this whenever init_db() adds a table/column. Purely informational — the
 # actual migration logic below is what's safe/idempotent — but it gives a
 # one-line way to confirm a deploy landed (`docker logs` on startup, or query
@@ -34,7 +43,16 @@ AUDIT_LOG_RETENTION_DAYS = int(os.environ.get("AUDIT_LOG_RETENTION_DAYS", 90))
 # device_users); this is where version tracking starts, not a full history.
 # 5 = super-admin override (users.is_super_admin) + private-device ownership
 # (device_meta.private_owner_id).
-SCHEMA_VERSION = 5
+# 6 = Labels feature (device_labels, label_users) replacing the old single
+# device_meta.notes field; notes content one-time-migrated into device_labels.
+SCHEMA_VERSION = 6
+
+# App release version — bumped independently of SCHEMA_VERSION (a release can
+# ship with no schema change, or vice versa). Tracked the same way: stamped
+# into app_settings every startup, with a change logged to audit_log (not
+# just overwritten silently) so Management's Activity Log shows a real
+# history of what version was running when.
+APP_VERSION = "3.0"
 
 
 def _load_or_create_secret_key() -> str:
@@ -96,6 +114,24 @@ def admin_required(view):
             abort(403)
         return view(*args, **kwargs)
     return wrapped
+
+
+def _super_admin_protected(target_user_id: int) -> bool:
+    """True if target_user_id is the super admin and the current session
+    belongs to a DIFFERENT account — i.e. the caller should be blocked from
+    modifying them. Identity-based (self == target), not role-based (any
+    is_super_admin session) — so even a second account that somehow also
+    carried is_super_admin can't touch the real one; only that exact account
+    can touch itself. No other admin has an override for this, matching the
+    same no-escape-hatch model as private devices. See bootstrap_admin()'s
+    RESET_ADMIN_PASSWORD env var for the out-of-band recovery path this
+    necessitates (self-service password change needs the current password,
+    which doesn't help if it's lost)."""
+    if session.get("user_id") == target_user_id:
+        return False
+    with sqlite3.connect(DB_PATH) as con:
+        row = con.execute("SELECT is_super_admin FROM users WHERE id = ?", (target_user_id,)).fetchone()
+    return bool(row and row[0])
 
 
 def _visible_group_ids() -> list[int]:
@@ -265,6 +301,43 @@ def init_db():
             )
         """)
         con.execute("""
+            CREATE TABLE IF NOT EXISTS device_labels (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                uuid       TEXT NOT NULL,
+                text       TEXT NOT NULL,
+                private    INTEGER NOT NULL DEFAULT 0,
+                created_by INTEGER REFERENCES users(id),
+                created_at TEXT DEFAULT (datetime('now')),
+                updated_at TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        con.execute("CREATE INDEX IF NOT EXISTS idx_device_labels_uuid ON device_labels(uuid)")
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS label_users (
+                label_id INTEGER NOT NULL REFERENCES device_labels(id),
+                user_id  INTEGER NOT NULL REFERENCES users(id),
+                PRIMARY KEY (label_id, user_id)
+            )
+        """)
+        # One-time backfill: the old single free-text device_meta.notes field
+        # becomes an initial public label per device that had one. Guarded by
+        # an app_settings flag (not "does device_labels have rows", which
+        # would wrongly re-run after a user deletes their last label) so this
+        # only ever runs once, even though init_db() runs on every startup.
+        if con.execute(
+            "SELECT value FROM app_settings WHERE key = 'notes_migrated_to_labels'"
+        ).fetchone() is None:
+            for uuid, notes in con.execute(
+                "SELECT uuid, notes FROM device_meta WHERE notes IS NOT NULL AND TRIM(notes) != ''"
+            ).fetchall():
+                con.execute(
+                    "INSERT INTO device_labels (uuid, text, private, created_by) VALUES (?, ?, 0, NULL)",
+                    (uuid, notes),
+                )
+            con.execute(
+                "INSERT INTO app_settings (key, value) VALUES ('notes_migrated_to_labels', '1')"
+            )
+        con.execute("""
             CREATE TABLE IF NOT EXISTS audit_log (
                 id        INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts        TEXT NOT NULL DEFAULT (datetime('now')),
@@ -277,12 +350,33 @@ def init_db():
             )
         """)
         con.execute("CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts)")
-        con.execute("""
-            INSERT INTO app_settings (key, value) VALUES ('schema_version', ?)
-            ON CONFLICT(key) DO UPDATE SET value = excluded.value
-        """, (str(SCHEMA_VERSION),))
+        _stamp_version(con, "schema_version", str(SCHEMA_VERSION))
+        _stamp_version(con, "app_version", APP_VERSION)
         con.commit()
     logging.info("Schema version: %d", SCHEMA_VERSION)
+    logging.info("App version: %s", APP_VERSION)
+
+
+def _stamp_version(con, key: str, new_value: str):
+    """Writes key's current value to app_settings, and — unlike a plain
+    overwrite — logs a real audit_log entry when it actually CHANGED from
+    last startup, so Management's Activity Log shows version history over
+    time, not just "whatever it is right now". Called from init_db(), which
+    runs at import time outside any Flask request context, so this can't go
+    through log_activity() (needs request.remote_addr/session) — it's a
+    direct INSERT with username='system' instead."""
+    prev = con.execute("SELECT value FROM app_settings WHERE key = ?", (key,)).fetchone()
+    prev_value = prev[0] if prev else None
+    if prev_value != new_value:
+        con.execute(
+            "INSERT INTO audit_log (user_id, username, action, target, detail, ip) "
+            "VALUES (NULL, 'system', ?, ?, ?, NULL)",
+            (f"{key}.change", new_value, f"from={prev_value or 'none'}"),
+        )
+    con.execute("""
+        INSERT INTO app_settings (key, value) VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    """, (key, new_value))
 
 
 def bootstrap_admin():
@@ -291,6 +385,7 @@ def bootstrap_admin():
     with sqlite3.connect(DB_PATH) as con:
         existing = con.execute("SELECT COUNT(*) FROM users WHERE is_admin = 1").fetchone()[0]
         if existing:
+            _maybe_reset_super_admin_password(con)
             return
         if not admin_user or not admin_password:
             logging.warning(
@@ -306,25 +401,45 @@ def bootstrap_admin():
         logging.info("Bootstrapped initial admin user %r", admin_user)
 
 
+def _maybe_reset_super_admin_password(con):
+    """Out-of-band recovery for the super admin ('admin') account's password.
+    Necessary precisely because no other admin can touch that account
+    anymore (see _super_admin_protected()) and self-service password change
+    needs the CURRENT password, which doesn't help if it's lost — this is
+    the only remaining recovery path, and it requires host/deploy access,
+    not just a web session, which is the point for the single most
+    privileged account.
+
+    Deliberately requires two separate env vars (not just reusing
+    ADMIN_PASSWORD alone) so a stale ADMIN_PASSWORD left in docker-compose.yml
+    can never silently clobber a real password change on an ordinary
+    restart — this exact failure mode happened once already this session
+    (see CLAUDE.md's auth/RBAC section). Unset RESET_ADMIN_PASSWORD (or both)
+    after use, or it will keep resetting on every restart."""
+    if os.environ.get("RESET_ADMIN_PASSWORD") != "1":
+        return
+    new_password = os.environ.get("ADMIN_PASSWORD")
+    if not new_password:
+        logging.warning("RESET_ADMIN_PASSWORD=1 is set but ADMIN_PASSWORD is empty — skipping reset")
+        return
+    cur = con.execute(
+        "UPDATE users SET password_hash = ? WHERE username = 'admin'",
+        (generate_password_hash(new_password),),
+    )
+    con.commit()
+    if cur.rowcount:
+        logging.warning(
+            "RESET_ADMIN_PASSWORD=1: forcibly reset the 'admin' account's password from "
+            "the ADMIN_PASSWORD env var. Remove RESET_ADMIN_PASSWORD before the next restart."
+        )
+    else:
+        logging.warning("RESET_ADMIN_PASSWORD=1 is set but no user named 'admin' exists — nothing reset")
+
+
 def get_archived_uuids() -> set:
     with sqlite3.connect(DB_PATH) as con:
         rows = con.execute("SELECT uuid FROM device_meta WHERE archived = 1").fetchall()
     return {r[0] for r in rows}
-
-
-def get_setting(key: str, default=None):
-    with sqlite3.connect(DB_PATH) as con:
-        row = con.execute("SELECT value FROM app_settings WHERE key = ?", (key,)).fetchone()
-    return row[0] if row else default
-
-
-def set_setting(key: str, value: str):
-    with sqlite3.connect(DB_PATH) as con:
-        con.execute("""
-            INSERT INTO app_settings (key, value) VALUES (?, ?)
-            ON CONFLICT(key) DO UPDATE SET value = excluded.value
-        """, (key, value))
-        con.commit()
 
 
 def log_activity(action: str, target: str | None = None, detail: str | None = None,
@@ -366,10 +481,6 @@ def _audit_log_pruner():
         time.sleep(24 * 60 * 60)
 
 
-def device_notes_enabled() -> bool:
-    return get_setting("device_notes_enabled", "0") == "1"
-
-
 def _device_visible(uuid: str) -> bool:
     """True if the current session user is allowed to see/annotate this
     device. Super admin: always. Private devices need an explicit
@@ -391,6 +502,27 @@ def _device_visible(uuid: str) -> bool:
     code_map = _code_to_group()
     gid = _device_group_id(row["name"], code_map)
     return gid is not None and gid in set(_visible_group_ids())
+
+
+def _label_accessible(con, label, uuid: str) -> bool:
+    """Whether the current session can see AND edit this label — the same
+    predicate for both, per the feature's own definition ("users who can see
+    a private label can make changes and make it public"). Any admin: always.
+    Public labels: anyone who can see the underlying device. Private labels:
+    the creator, or an explicit label_users grant — being an admin alone is
+    NOT required to create/edit a public label, matching the old fully-open
+    device-notes behavior this feature replaces."""
+    if session.get("is_admin"):
+        return True
+    if not label["private"]:
+        return _device_visible(uuid)
+    if label["created_by"] == session.get("user_id"):
+        return True
+    granted = con.execute(
+        "SELECT 1 FROM label_users WHERE label_id = ? AND user_id = ?",
+        (label["id"], session["user_id"]),
+    ).fetchone()
+    return bool(granted)
 
 
 def store_observations(records: list[dict]) -> list[dict]:
@@ -541,7 +673,12 @@ def tcp_listener():
 @app.route("/")
 @login_required
 def index():
-    return render_template("index.html")
+    return render_template(
+        "index.html",
+        basemap_wms_url=BASEMAP_WMS_URL,
+        basemap_wms_layers=BASEMAP_WMS_LAYERS,
+        basemap_attribution=BASEMAP_ATTRIBUTION,
+    )
 
 
 @app.route("/login", methods=["GET", "POST"])
@@ -602,6 +739,7 @@ def api_me():
             ORDER BY g.name
         """, (session["user_id"],)).fetchall()
     return jsonify({
+        "id": session["user_id"],
         "username": session["username"],
         "is_admin": bool(session["is_admin"]),
         "is_super_admin": bool(session.get("is_super_admin")),
@@ -609,23 +747,6 @@ def api_me():
         "last_name": user["last_name"] if user else None,
         "groups": [dict(g) for g in groups],
     })
-
-
-@app.route("/api/settings")
-@login_required
-def api_settings():
-    return jsonify({"device_notes_enabled": device_notes_enabled()})
-
-
-@app.route("/api/admin/settings", methods=["PATCH"])
-@admin_required
-def admin_update_settings():
-    data = request.get_json(force=True, silent=True) or {}
-    if "device_notes_enabled" in data:
-        set_setting("device_notes_enabled", "1" if data["device_notes_enabled"] else "0")
-        log_activity("settings.update", target="device_notes_enabled",
-                     detail=str(bool(data["device_notes_enabled"])))
-    return jsonify({"device_notes_enabled": device_notes_enabled()})
 
 
 @app.route("/api/change-password", methods=["POST"])
@@ -653,22 +774,136 @@ def change_password():
     return jsonify({"ok": True})
 
 
-@app.route("/api/devices/<uuid>/notes", methods=["POST"])
+@app.route("/api/devices/<uuid>/labels")
 @login_required
-def update_device_notes(uuid):
-    if not device_notes_enabled():
-        return jsonify({"error": "device notes are disabled"}), 403
+def get_device_labels(uuid):
+    if not _device_visible(uuid):
+        return jsonify({"error": "not found"}), 404
+    with sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        rows = con.execute("""
+            SELECT dl.*, u.username AS created_by_username
+            FROM device_labels dl
+            LEFT JOIN users u ON u.id = dl.created_by
+            WHERE dl.uuid = ?
+            ORDER BY dl.created_at
+        """, (uuid,)).fetchall()
+        allowed_by_label: dict[int, list] = {}
+        label_ids = [r["id"] for r in rows]
+        if label_ids:
+            placeholders = ",".join("?" * len(label_ids))
+            for lid, uid, uname in con.execute(f"""
+                SELECT lu.label_id, u.id, u.username FROM label_users lu
+                JOIN users u ON u.id = lu.user_id
+                WHERE lu.label_id IN ({placeholders})
+            """, label_ids).fetchall():
+                allowed_by_label.setdefault(lid, []).append({"id": uid, "username": uname})
+
+        result = []
+        for r in rows:
+            if not _label_accessible(con, r, uuid):
+                continue
+            result.append({
+                "id": r["id"], "uuid": r["uuid"], "text": r["text"], "private": bool(r["private"]),
+                "created_by": r["created_by"], "created_by_username": r["created_by_username"],
+                "allowed_users": allowed_by_label.get(r["id"], []),
+                "created_at": r["created_at"], "updated_at": r["updated_at"],
+            })
+    return jsonify(result)
+
+
+@app.route("/api/devices/<uuid>/labels", methods=["POST"])
+@login_required
+def create_device_label(uuid):
     if not _device_visible(uuid):
         return jsonify({"error": "not found"}), 404
     data = request.get_json(force=True, silent=True) or {}
-    notes = (data.get("notes") or "").strip()
+    text = (data.get("text") or "").strip()
+    if not text:
+        return jsonify({"error": "text is required"}), 400
+    private = bool(data.get("private"))
+    user_ids = data.get("user_ids") or []
     with sqlite3.connect(DB_PATH) as con:
-        con.execute("""
-            INSERT INTO device_meta (uuid, notes) VALUES (?, ?)
-            ON CONFLICT(uuid) DO UPDATE SET notes = excluded.notes
-        """, (uuid, notes))
+        cur = con.execute(
+            "INSERT INTO device_labels (uuid, text, private, created_by) VALUES (?, ?, ?, ?)",
+            (uuid, text, int(private), session["user_id"]),
+        )
+        label_id = cur.lastrowid
+        if private:
+            for uid in user_ids:
+                con.execute("INSERT OR IGNORE INTO label_users (label_id, user_id) VALUES (?, ?)", (label_id, uid))
         con.commit()
-    return jsonify({"uuid": uuid, "notes": notes})
+    return jsonify({"id": label_id, "ok": True})
+
+
+@app.route("/api/labels/<int:label_id>", methods=["PATCH"])
+@login_required
+def update_device_label(label_id):
+    data = request.get_json(force=True, silent=True) or {}
+    with sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        label = con.execute("SELECT * FROM device_labels WHERE id = ?", (label_id,)).fetchone()
+        if not label or not _label_accessible(con, label, label["uuid"]):
+            return jsonify({"error": "not found"}), 404
+
+        updates, params = [], []
+        if "text" in data:
+            text = (data.get("text") or "").strip()
+            if not text:
+                return jsonify({"error": "text cannot be empty"}), 400
+            updates.append("text = ?")
+            params.append(text)
+        if "private" in data:
+            updates.append("private = ?")
+            params.append(1 if data["private"] else 0)
+        if updates:
+            updates.append("updated_at = datetime('now')")
+            params.append(label_id)
+            con.execute(f"UPDATE device_labels SET {', '.join(updates)} WHERE id = ?", params)
+        if "user_ids" in data:
+            con.execute("DELETE FROM label_users WHERE label_id = ?", (label_id,))
+            for uid in data["user_ids"] or []:
+                con.execute("INSERT OR IGNORE INTO label_users (label_id, user_id) VALUES (?, ?)", (label_id, uid))
+        con.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/labels/<int:label_id>", methods=["DELETE"])
+@login_required
+def delete_device_label(label_id):
+    with sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        label = con.execute("SELECT * FROM device_labels WHERE id = ?", (label_id,)).fetchone()
+        if not label or not _label_accessible(con, label, label["uuid"]):
+            return jsonify({"error": "not found"}), 404
+        con.execute("DELETE FROM label_users WHERE label_id = ?", (label_id,))
+        con.execute("DELETE FROM device_labels WHERE id = ?", (label_id,))
+        con.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/devices/<uuid>/group-members")
+@login_required
+def device_group_members(uuid):
+    """Candidates for granting a private label — members of THIS device's
+    derived group specifically, not the requester's own groups (a user can
+    belong to several groups; only the device's actual group is relevant)."""
+    if not _device_visible(uuid):
+        return jsonify({"error": "not found"}), 404
+    with sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        name_row = con.execute("SELECT name FROM observations WHERE uuid = ? LIMIT 1", (uuid,)).fetchone()
+        if not name_row:
+            return jsonify([])
+        code_map = _code_to_group()
+        gid = _device_group_id(name_row["name"], code_map)
+        if gid is None:
+            return jsonify([])
+        rows = con.execute("""
+            SELECT u.id, u.username FROM user_groups ug JOIN users u ON u.id = ug.user_id
+            WHERE ug.group_id = ? ORDER BY u.username
+        """, (gid,)).fetchall()
+    return jsonify([dict(r) for r in rows])
 
 
 @app.route("/api/devices")
@@ -678,7 +913,7 @@ def api_devices():
 
     query = """
         SELECT o.uuid, o.name, o.lat, o.lon, o.obs_time AS last_seen,
-               o.accuracy, o.confidence, cnt.fix_count, m.archived_at, m.notes,
+               o.accuracy, o.confidence, cnt.fix_count, m.archived_at,
                COALESCE(m.private, 0) AS private,
                g.id AS group_id, COALESCE(g.name, 'Unassigned') AS group_name, g.color AS group_color
         FROM observations o
@@ -817,7 +1052,8 @@ def admin_users():
         with sqlite3.connect(DB_PATH) as con:
             con.row_factory = sqlite3.Row
             users = con.execute(
-                "SELECT id, username, first_name, last_name, is_admin, created_at FROM users ORDER BY username"
+                "SELECT id, username, first_name, last_name, is_admin, is_super_admin, created_at "
+                "FROM users ORDER BY username"
             ).fetchall()
             groups_by_user: dict[int, list] = {}
             for row in con.execute("""
@@ -828,7 +1064,7 @@ def admin_users():
         return jsonify([{
             "id": u["id"], "username": u["username"],
             "first_name": u["first_name"], "last_name": u["last_name"],
-            "is_admin": bool(u["is_admin"]),
+            "is_admin": bool(u["is_admin"]), "is_super_admin": bool(u["is_super_admin"]),
             "created_at": u["created_at"], "groups": groups_by_user.get(u["id"], []),
         } for u in users])
 
@@ -864,6 +1100,8 @@ def admin_users():
 @app.route("/api/admin/users/<int:user_id>", methods=["PATCH"])
 @admin_required
 def admin_update_user(user_id):
+    if _super_admin_protected(user_id):
+        return jsonify({"error": "the super admin account can only be modified by itself"}), 403
     data = request.get_json(force=True, silent=True) or {}
     with sqlite3.connect(DB_PATH) as con:
         target_row = con.execute("SELECT username FROM users WHERE id = ?", (user_id,)).fetchone()
@@ -878,6 +1116,17 @@ def admin_update_user(user_id):
                         ((data.get("last_name") or "").strip() or None, user_id))
 
         if "is_admin" in data and not data["is_admin"]:
+            # _super_admin_protected() lets the super admin modify THEMSELVES in
+            # general (needed for self-service name/password edits), but
+            # self-revoking admin status is uniquely dangerous: admin_required
+            # (gating the whole Management page + all /api/admin/* routes)
+            # checks is_admin, not is_super_admin — so this would immediately
+            # lock the super admin out of the UI that could undo it.
+            target_super = con.execute(
+                "SELECT is_super_admin FROM users WHERE id = ?", (user_id,)
+            ).fetchone()
+            if target_super and target_super[0]:
+                return jsonify({"error": "the super admin account's admin status cannot be revoked"}), 400
             other_admins = con.execute(
                 "SELECT COUNT(*) FROM users WHERE is_admin = 1 AND id != ?", (user_id,)
             ).fetchone()[0]
@@ -905,6 +1154,8 @@ def admin_update_user(user_id):
 @app.route("/api/admin/users/<int:user_id>/password", methods=["POST"])
 @admin_required
 def admin_reset_password(user_id):
+    if _super_admin_protected(user_id):
+        return jsonify({"error": "the super admin account can only be modified by itself"}), 403
     data = request.get_json(force=True, silent=True) or {}
     password = data.get("password") or ""
     if not password:
@@ -921,8 +1172,16 @@ def admin_reset_password(user_id):
 @app.route("/api/admin/users/<int:user_id>", methods=["DELETE"])
 @admin_required
 def admin_delete_user(user_id):
+    if _super_admin_protected(user_id):
+        return jsonify({"error": "the super admin account can only be modified by itself"}), 403
     with sqlite3.connect(DB_PATH) as con:
-        target = con.execute("SELECT is_admin, username FROM users WHERE id = ?", (user_id,)).fetchone()
+        target = con.execute("SELECT is_admin, username, is_super_admin FROM users WHERE id = ?", (user_id,)).fetchone()
+        # Not even the super admin can delete themselves — bootstrap_admin()
+        # only re-seeds a fresh admin when ZERO admins exist at all, so if any
+        # other regular admin remains, deleting "admin" would permanently
+        # remove the super-admin role from the system with no auto-recovery.
+        if target and target[2]:
+            return jsonify({"error": "the super admin account cannot be deleted"}), 400
         if target and target[0]:
             other_admins = con.execute(
                 "SELECT COUNT(*) FROM users WHERE is_admin = 1 AND id != ?", (user_id,)
@@ -931,6 +1190,7 @@ def admin_delete_user(user_id):
                 return jsonify({"error": "cannot delete the last admin"}), 400
         con.execute("DELETE FROM user_groups WHERE user_id = ?", (user_id,))
         con.execute("DELETE FROM device_users WHERE user_id = ?", (user_id,))
+        con.execute("DELETE FROM label_users WHERE user_id = ?", (user_id,))
         con.execute("DELETE FROM users WHERE id = ?", (user_id,))
         con.commit()
     log_activity("user.delete", target=target[1] if target else str(user_id))
@@ -1206,6 +1466,12 @@ def admin_audit_log():
     return jsonify([dict(r) for r in rows])
 
 
+@app.route("/api/admin/version")
+@admin_required
+def admin_version():
+    return jsonify({"app_version": APP_VERSION, "schema_version": SCHEMA_VERSION})
+
+
 def _device_backup_payload(uuid: str) -> dict:
     with sqlite3.connect(DB_PATH) as con:
         con.row_factory = sqlite3.Row
@@ -1214,13 +1480,32 @@ def _device_backup_payload(uuid: str) -> dict:
             FROM observations WHERE uuid = ? ORDER BY obs_time
         """, (uuid,)).fetchall()
         meta = con.execute(
-            "SELECT uuid, archived, archived_at, notes FROM device_meta WHERE uuid = ?", (uuid,)
+            "SELECT uuid, archived, archived_at, private FROM device_meta WHERE uuid = ?", (uuid,)
         ).fetchone()
+        labels = con.execute("""
+            SELECT dl.id, dl.text, dl.private, u.username AS created_by_username, dl.created_at, dl.updated_at
+            FROM device_labels dl LEFT JOIN users u ON u.id = dl.created_by
+            WHERE dl.uuid = ? ORDER BY dl.created_at
+        """, (uuid,)).fetchall()
+        allowed_by_label: dict[int, list] = {}
+        label_ids = [r["id"] for r in labels]
+        if label_ids:
+            placeholders = ",".join("?" * len(label_ids))
+            for lid, uname in con.execute(f"""
+                SELECT lu.label_id, u.username FROM label_users lu
+                JOIN users u ON u.id = lu.user_id WHERE lu.label_id IN ({placeholders})
+            """, label_ids).fetchall():
+                allowed_by_label.setdefault(lid, []).append(uname)
     return {
         "uuid": uuid,
         "backed_up_at": datetime.now(timezone.utc).isoformat(),
         "device_meta": dict(meta) if meta else None,
         "observations": [dict(r) for r in observations],
+        "labels": [{
+            "text": l["text"], "private": bool(l["private"]), "created_by_username": l["created_by_username"],
+            "allowed_usernames": allowed_by_label.get(l["id"], []),
+            "created_at": l["created_at"], "updated_at": l["updated_at"],
+        } for l in labels],
     }
 
 
@@ -1278,6 +1563,11 @@ def delete_device_permanently(uuid):
         con.execute("DELETE FROM observations WHERE uuid = ?", (uuid,))
         con.execute("DELETE FROM device_meta WHERE uuid = ?", (uuid,))
         con.execute("DELETE FROM device_users WHERE uuid = ?", (uuid,))
+        label_ids = [r[0] for r in con.execute("SELECT id FROM device_labels WHERE uuid = ?", (uuid,)).fetchall()]
+        if label_ids:
+            placeholders = ",".join("?" * len(label_ids))
+            con.execute(f"DELETE FROM label_users WHERE label_id IN ({placeholders})", label_ids)
+        con.execute("DELETE FROM device_labels WHERE uuid = ?", (uuid,))
         con.commit()
     log_activity("device.delete", target=uuid)
     return jsonify({"uuid": uuid, "deleted": True})

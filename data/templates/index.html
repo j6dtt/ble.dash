@@ -254,10 +254,16 @@ html, body { height: 100%; font-family: 'Segoe UI', sans-serif; background: #0d1
   display: flex; align-items: center; justify-content: center; z-index: 2000;
 }
 .modal {
-  width: 340px; max-width: 90vw; background: #161b22; border: 1px solid #30363d;
+  width: 400px; max-width: 90vw; background: #161b22; border: 1px solid #30363d;
   border-radius: 8px; padding: 20px; box-shadow: 0 8px 30px rgba(0,0,0,.5);
 }
-.modal-title { font-size: .92rem; font-weight: 600; color: #58a6ff; margin-bottom: 14px; }
+.modal-header { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 14px; }
+.modal-title { font-size: .92rem; font-weight: 600; color: #58a6ff; }
+.modal-close-x {
+  flex-shrink: 0; width: 24px; height: 24px; padding: 0; background: none; border: none;
+  color: #8b949e; font-size: 1rem; line-height: 1; cursor: pointer; border-radius: 4px;
+}
+.modal-close-x:hover { color: #c9d1d9; background: #21262d; }
 .modal-body { font-size: .82rem; color: #c9d1d9; margin-bottom: 18px; }
 .modal-body label { display: block; font-size: .72rem; color: #8b949e; margin: 12px 0 4px; }
 .modal-body label:first-child { margin-top: 0; }
@@ -273,15 +279,32 @@ html, body { height: 100%; font-family: 'Segoe UI', sans-serif; background: #0d1
   border: 1px solid #30363d; color: #c9d1d9; font-size: .78rem; cursor: pointer;
 }
 .modal-actions .btn.primary { border-color: #58a6ff; color: #58a6ff; }
+.modal-actions .btn.danger  { border-color: #f85149; color: #f85149; }
+.modal-checklist { max-height: 160px; overflow-y: auto; border: 1px solid #30363d; border-radius: 4px; padding: 8px 10px; margin-top: 4px; }
+.modal-checklist .check-row { display: flex; align-items: center; gap: 8px; font-size: .8rem; color: #c9d1d9; padding: 4px 0; }
 
-/* ── Device notes ────────────────────────────────────────────────── */
-.card-notes {
-  width: 100%; margin-top: 8px; padding: 6px 8px; background: #0d1117;
-  border: 1px solid #30363d; border-radius: 4px; color: #c9d1d9;
-  font-size: .74rem; font-family: inherit; outline: none; resize: none;
+/* ── Labels ──────────────────────────────────────────────────────── */
+.card-labels-btn {
+  width: 100%; margin-top: 8px; height: 26px; padding: 0 8px;
+  background: #0d1117; border: 1px solid #30363d; border-radius: 4px;
+  color: #8b949e; font-size: .72rem; cursor: pointer;
 }
-.card-notes:focus { border-color: #58a6ff; }
-.card-notes::placeholder { color: #6e7681; }
+.card-labels-btn:hover { border-color: #58a6ff; color: #58a6ff; }
+.label-row {
+  border: 1px solid #30363d; border-radius: 6px; padding: 8px 10px; margin-bottom: 6px;
+  display: flex; align-items: flex-start; justify-content: space-between; gap: 8px;
+}
+.label-text { font-size: .82rem; color: #c9d1d9; word-break: break-word; }
+.label-meta { font-size: .68rem; color: #8b949e; margin-top: 3px; }
+.label-actions { display: flex; gap: 6px; flex-shrink: 0; }
+.btn-mini {
+  height: 24px; padding: 0 8px; border-radius: 4px; background: #21262d;
+  border: 1px solid #30363d; color: #c9d1d9; font-size: .68rem; cursor: pointer; white-space: nowrap;
+}
+.btn-mini:hover { border-color: #58a6ff; color: #58a6ff; }
+.btn-mini.danger:hover { border-color: #f85149; color: #f85149; }
+#labels-list { max-height: 260px; overflow-y: auto; margin-bottom: 14px; }
+.labels-empty { color: #8b949e; font-size: .8rem; margin-bottom: 14px; }
 </style>
 </head>
 <body>
@@ -360,10 +383,12 @@ html, body { height: 100%; font-family: 'Segoe UI', sans-serif; background: #0d1
 
 <div id="modal-backdrop" class="modal-backdrop" style="display:none;" onclick="if (event.target === this) closeModal()">
   <div class="modal">
-    <div class="modal-title" id="modal-title"></div>
+    <div class="modal-header">
+      <div class="modal-title" id="modal-title"></div>
+      <button class="modal-close-x" onclick="closeModal()" aria-label="Close" title="Close">✕</button>
+    </div>
     <div class="modal-body" id="modal-body"></div>
     <div class="modal-actions">
-      <button class="btn" onclick="closeModal()">Cancel</button>
       <button class="btn primary" id="modal-confirm-btn"></button>
     </div>
   </div>
@@ -380,10 +405,22 @@ L.Icon.Default.mergeOptions({
 
 // ── Map ───────────────────────────────────────────────────────────
 const map = L.map('map').setView([33.30, 44.39], 14);
+{% if basemap_wms_url %}
+// Prod: NGA WMS basemap (set via BASEMAP_WMS_URL env var — see CLAUDE.md).
+L.tileLayer.wms({{ basemap_wms_url | tojson }}, {
+  layers: {{ basemap_wms_layers | tojson }},
+  format: 'image/png',
+  tiled: true,
+  maxZoom: 19,
+  attribution: {{ basemap_attribution | tojson }}
+}).addTo(map);
+{% else %}
+// Dev (default): public OSM raster tiles — no internal network required.
 L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
   attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
   maxZoom: 19, subdomains: 'abc'
 }).addTo(map);
+{% endif %}
 
 L.Control.ResetView = L.Control.extend({
   options: { position: 'topleft' },
@@ -425,7 +462,6 @@ const layers  = {};
 let allTracks = [];
 let cachedDevices = [];
 let currentUser = null;
-let deviceNotesEnabled = false;
 
 // Drill-down: at most one device's full trail is ever shown at a time.
 // Overview (selectedDevice === null) shows only latest-position markers.
@@ -820,26 +856,172 @@ function deviceCardHtml(d) {
       <span><span class="stat-val">${ago(d.last_seen)}</span></span>
     </div>
     <div class="card-lastseen">${d.last_seen || '—'}</div>
-    ${deviceNotesEnabled ? `<input type="text" class="card-notes" placeholder="Add a note…" value="${escapeHtml(d.notes)}"
-      onclick="event.stopPropagation()" onmousedown="event.stopPropagation()"
-      onkeydown="if(event.key==='Enter') this.blur()"
-      onblur="saveDeviceNotes('${d.uuid}', this.value)">` : ''}
+    <button class="card-labels-btn" onclick="event.stopPropagation(); openDeviceLabels('${d.uuid}', '${d.name.replace(/'/g, "\\'")}')">🏷 Labels</button>
   </div>`;
 }
 
-async function saveDeviceNotes(uuid, value) {
-  const notes = value.trim();
-  const cached = cachedDevices.find(d => d.uuid === uuid);
-  if (cached && (cached.notes || '') === notes) return;   // unchanged, skip network call
-  try {
-    await fetch(`/api/devices/${uuid}/notes`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ notes }),
-    });
-    if (cached) cached.notes = notes;
-  } catch (e) {
-    // best-effort save — leave the typed value in the field, don't disrupt the UI
+// ── Labels ───────────────────────────────────────────────────────────
+// A device can carry several independent labels (not one shared field) —
+// each has its own text, creator, and privacy. A public label is visible to
+// anyone who can see the device and editable by anyone who can see the
+// device (matches the old fully-open device-notes behavior this replaces).
+// A private label is visible/editable only by its creator, whoever it's
+// explicitly shared with (from the device's own group — see
+// /api/devices/<uuid>/group-members), or any admin. Visibility and edit
+// rights are the same check server-side (_label_accessible()) — if a label
+// appears in the list at all, the viewer can edit or delete it.
+let labelGrantCandidates = null;   // cached group-members list for whichever label modal is open
+
+async function openDeviceLabels(uuid, name) {
+  labelGrantCandidates = null;
+  let labels = [];
+  try { labels = await fetch(`/api/devices/${uuid}/labels`).then(r => r.json()); } catch (e) {}
+  renderLabelsModal(uuid, name, labels);
+}
+
+function renderLabelsModal(uuid, name, labels) {
+  const listHtml = labels.length
+    ? labels.map(l => labelRowHtml(uuid, name, l)).join('')
+    : '<div class="labels-empty">No labels yet.</div>';
+
+  openModal(`Labels — ${escapeHtml(name)}`, `
+    <div id="labels-list">${listHtml}</div>
+    <label for="new-label-text">Add a label</label>
+    <input type="text" id="new-label-text" placeholder="e.g. Battery low">
+    <label style="display:flex;align-items:center;gap:6px;margin-top:10px;">
+      <input type="checkbox" id="new-label-private"
+        onchange="onLabelPrivateToggle('${uuid}', 'new-label-grant-area', 'new-label-grant-list', this.checked, [])">
+      Private (only specific group members can see it)
+    </label>
+    <div id="new-label-grant-area" style="display:none;margin-top:8px;">
+      <label>Who else can see it</label>
+      <div id="new-label-grant-list" class="modal-checklist"></div>
+    </div>
+    <div class="modal-error" id="label-modal-error"></div>
+  `, {
+    confirmLabel: 'Add label',
+    onConfirm: async () => {
+      const text = document.getElementById('new-label-text').value.trim();
+      const errEl = document.getElementById('label-modal-error');
+      if (!text) { errEl.textContent = 'Label text is required'; return false; }
+      const priv = document.getElementById('new-label-private').checked;
+      const user_ids = priv ? checkedGrantIds('new-label-grant-list') : [];
+      try {
+        const res = await fetch(`/api/devices/${uuid}/labels`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text, private: priv, user_ids }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) { errEl.textContent = data.error || 'Failed to add label'; return false; }
+      } catch (e) { errEl.textContent = 'Failed to add label'; return false; }
+      openDeviceLabels(uuid, name);   // refresh the modal in place with the new label included
+      return false;
+    },
+  });
+}
+
+function checkedGrantIds(listId) {
+  return Array.from(document.querySelectorAll(`#${listId} input[type="checkbox"]:checked`)).map(el => Number(el.value));
+}
+
+// Shared by both the add and edit forms. Candidates are fetched once per
+// open label-modal "session" and cached (labelGrantCandidates), scoped to
+// the DEVICE's own group — not the viewer's groups (a user can belong to
+// several groups; only the device's actual group is relevant here).
+async function onLabelPrivateToggle(uuid, areaId, listId, checked, checkedIds) {
+  document.getElementById(areaId).style.display = checked ? 'block' : 'none';
+  if (!checked) return;
+  const listEl = document.getElementById(listId);
+  if (!labelGrantCandidates) {
+    listEl.innerHTML = '<p style="color:#8b949e;margin:0;">Loading…</p>';
+    try {
+      labelGrantCandidates = await fetch(`/api/devices/${uuid}/group-members`).then(r => r.json());
+    } catch (e) {
+      labelGrantCandidates = [];
+      listEl.innerHTML = '<p style="color:#f85149;margin:0;">Failed to load group members</p>';
+      return;
+    }
+  }
+  const checkedSet = new Set(checkedIds);
+  listEl.innerHTML = labelGrantCandidates.length
+    ? labelGrantCandidates.map(u => `
+        <div class="check-row">
+          <input type="checkbox" id="${listId}-${u.id}" value="${u.id}" ${checkedSet.has(u.id) ? 'checked' : ''}>
+          <label for="${listId}-${u.id}" style="margin:0;">${escapeHtml(u.username)}</label>
+        </div>`).join('')
+    : '<p style="color:#8b949e;margin:0;">No other group members to share with.</p>';
+}
+
+function labelRowHtml(uuid, name, l) {
+  const sharedWith = l.private
+    ? (l.allowed_users.length ? ` · shared with ${l.allowed_users.map(u => escapeHtml(u.username)).join(', ')}` : ' · shared with no one yet')
+    : '';
+  return `
+    <div class="label-row">
+      <div>
+        <div class="label-text">${escapeHtml(l.text)}</div>
+        <div class="label-meta">${l.private ? '🔒 private' : 'public'} · by ${escapeHtml(l.created_by_username || 'system')}${sharedWith}</div>
+      </div>
+      <div class="label-actions">
+        <button class="btn-mini" onclick="openEditLabel('${uuid}', '${name.replace(/'/g, "\\'")}', ${l.id})">Edit</button>
+        <button class="btn-mini danger" onclick="deleteLabel('${uuid}', '${name.replace(/'/g, "\\'")}', ${l.id})">Delete</button>
+      </div>
+    </div>`;
+}
+
+function deleteLabel(uuid, name, labelId) {
+  openConfirm('Delete label', 'Delete this label? This cannot be undone.', async () => {
+    try { await fetch(`/api/labels/${labelId}`, { method: 'DELETE' }); } catch (e) {}
+    openDeviceLabels(uuid, name);
+    return false;
+  });
+}
+
+async function openEditLabel(uuid, name, labelId) {
+  labelGrantCandidates = null;
+  let labels = [];
+  try { labels = await fetch(`/api/devices/${uuid}/labels`).then(r => r.json()); } catch (e) {}
+  const label = labels.find(l => l.id === labelId);
+  if (!label) { openDeviceLabels(uuid, name); return; }
+  const currentIds = (label.allowed_users || []).map(u => u.id);
+
+  openModal('Edit label', `
+    <label for="edit-label-text">Label text</label>
+    <input type="text" id="edit-label-text" value="${escapeHtml(label.text)}">
+    <label style="display:flex;align-items:center;gap:6px;margin-top:10px;">
+      <input type="checkbox" id="edit-label-private" ${label.private ? 'checked' : ''}
+        onchange="onLabelPrivateToggle('${uuid}', 'edit-label-grant-area', 'edit-label-grant-list', this.checked, ${JSON.stringify(currentIds)})">
+      Private (only specific group members can see it)
+    </label>
+    <div id="edit-label-grant-area" style="display:none;margin-top:8px;">
+      <label>Who else can see it</label>
+      <div id="edit-label-grant-list" class="modal-checklist"></div>
+    </div>
+    <div class="modal-error" id="label-modal-error"></div>
+  `, {
+    confirmLabel: 'Save',
+    onConfirm: async () => {
+      const text = document.getElementById('edit-label-text').value.trim();
+      const errEl = document.getElementById('label-modal-error');
+      if (!text) { errEl.textContent = 'Label text is required'; return false; }
+      const priv = document.getElementById('edit-label-private').checked;
+      const user_ids = priv ? checkedGrantIds('edit-label-grant-list') : [];
+      try {
+        const res = await fetch(`/api/labels/${labelId}`, {
+          method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text, private: priv, user_ids }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) { errEl.textContent = data.error || 'Failed to update label'; return false; }
+      } catch (e) { errEl.textContent = 'Failed to update label'; return false; }
+      openDeviceLabels(uuid, name);
+      return false;
+    },
+  });
+  // Already private: show + populate the grant checklist immediately instead
+  // of requiring an extra uncheck/recheck of the "Private" box to reveal it.
+  if (label.private) {
+    await onLabelPrivateToggle(uuid, 'edit-label-grant-area', 'edit-label-grant-list', true, currentIds);
   }
 }
 
@@ -997,11 +1179,12 @@ function ensureVisible(uuids) {
 // ── Modal (replaces native prompt()/confirm()) ─────────────────────
 // onConfirm may return `false` to keep the modal open (e.g. validation
 // failed) — anything else closes it.
-function openModal(title, bodyHtml, { confirmLabel = 'Save', onConfirm }) {
+function openModal(title, bodyHtml, { confirmLabel = 'Save', danger = false, onConfirm }) {
   document.getElementById('modal-title').textContent = title;
   document.getElementById('modal-body').innerHTML = bodyHtml;
   const btn = document.getElementById('modal-confirm-btn');
   btn.textContent = confirmLabel;
+  btn.className = 'btn ' + (danger ? 'danger' : 'primary');
   btn.onclick = async () => {
     const result = await onConfirm();
     if (result !== false) closeModal();
@@ -1013,6 +1196,10 @@ function openModal(title, bodyHtml, { confirmLabel = 'Save', onConfirm }) {
 
 function closeModal() {
   document.getElementById('modal-backdrop').style.display = 'none';
+}
+
+function openConfirm(title, message, onConfirm) {
+  openModal(title, `<p>${message}</p>`, { confirmLabel: 'Delete', danger: true, onConfirm });
 }
 
 document.addEventListener('keydown', (e) => {
@@ -1092,14 +1279,12 @@ async function logout() {
 }
 
 async function loadAll() {
-  const [tracks, devices, me, settings] = await Promise.all([
+  const [tracks, devices, me] = await Promise.all([
     fetch('/api/tracks').then(r => r.json()),
     fetch('/api/devices').then(r => r.json()),
     fetch('/api/me').then(r => r.json()),
-    fetch('/api/settings').then(r => r.json()),
   ]);
   currentUser = me;
-  deviceNotesEnabled = settings.device_notes_enabled;
   syncUserUI();
   allTracks = tracks;
   renderTracks(allTracks);

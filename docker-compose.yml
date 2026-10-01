@@ -17,3 +17,13 @@ services:
       # SECRET_KEY: ""   # optional — if unset, a random key is generated once and
       #                   # persisted to /app/secret_key.txt (in the ./data volume)
       # AUDIT_LOG_RETENTION_DAYS: "90"   # optional — rows older than this are pruned daily; default 90
+      # RESET_ADMIN_PASSWORD: "1"   # break-glass only: set this + ADMIN_PASSWORD to the new
+      #                             # password, then `docker compose up -d`, then UNSET both
+      #                             # (or at least this flag) before the next restart — the
+      #                             # super admin ("admin") account can't be reset any other way
+      #
+      # Basemap — unset (default) uses public OSM raster tiles (dev). Set
+      # BASEMAP_WMS_URL to switch to a WMS basemap instead (prod):
+      # BASEMAP_WMS_URL: "https://maps.geo.nga.smil.mil/osm/wms/OSM_WORLD/basemap/OSM_BASEMAP/OSM_ENGLISH"
+      # BASEMAP_WMS_LAYERS: "OSM_BASEMAP"   # optional, this is already the default
+      # BASEMAP_ATTRIBUTION: "NGA OSM"      # optional, this is already the default
