@@ -49,3 +49,8 @@ services:
       # LLM_MAX_CONCURRENT: "4"      # optional, this is already the default — bounds how many
       #                              # /api/ai/ask streams can run at once (shares gunicorn's
       #                              # thread pool with /stream — see gunicorn_config.py)
+      # LLM_VERIFY_SSL: "0"   # PROD ONLY — self-hosted vLLM sits behind an internal/self-signed
+      #                       # cert that won't validate. Leave unset/"1" everywhere else (dev's
+      #                       # NVIDIA endpoint has a real cert and should always be verified) —
+      #                       # never flip this default, only override it here on prod's own
+      #                       # docker-compose.yml.

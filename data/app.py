@@ -67,6 +67,18 @@ LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
 # larger model/prompt makes cold CPU inference in dev time out again.
 LLM_TIMEOUT_SECONDS = int(os.environ.get("LLM_TIMEOUT_SECONDS", 60))
 LLM_MAX_CONCURRENT = int(os.environ.get("LLM_MAX_CONCURRENT", 4))
+# Default ON everywhere — dev's LLM_API_BASE_URL points at a real, properly
+# certed endpoint (NVIDIA hosted / Ollama on localhost) and should never skip
+# validation. Prod's self-hosted vLLM sits behind an internal/self-signed
+# cert, so ONLY prod's docker-compose.yml sets this to "0" — never flip this
+# default itself, that would silently disable cert checking in dev too for
+# zero benefit. When off, also silence urllib3's InsecureRequestWarning
+# (requests emits one per unverified request otherwise, which would spam the
+# gunicorn log once a second on an active Ask Goby conversation).
+LLM_VERIFY_SSL = os.environ.get("LLM_VERIFY_SSL", "1") != "0"
+if not LLM_VERIFY_SSL:
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Bump this whenever init_db() adds a table/column. Purely informational — the
 # actual migration logic below is what's safe/idempotent — but it gives a
@@ -1532,6 +1544,7 @@ def _llm_chat_once(messages: list[dict], tools: list[dict] | None = None) -> dic
         f"{LLM_API_BASE_URL}/chat/completions", json=payload,
         headers={"Authorization": f"Bearer {LLM_API_KEY}"} if LLM_API_KEY else {},
         timeout=(10, LLM_TIMEOUT_SECONDS),
+        verify=LLM_VERIFY_SSL,
     )
     resp.raise_for_status()
     return resp.json()["choices"][0]
