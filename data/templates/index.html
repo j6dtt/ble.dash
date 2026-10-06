@@ -39,6 +39,37 @@ html, body { height: 100%; font-family: 'Segoe UI', sans-serif; background: #0d1
 #live-dot.on { background: #3fb950; box-shadow: 0 0 6px #3fb950; }
 
 /* ── User menu ─────────────────────────────────────────────────── */
+#alerts-menu { position: relative; }
+#alerts-menu-btn {
+  position: relative; display: flex; align-items: center; height: 36px; padding: 0 10px;
+  border-radius: 8px; background: transparent; border: 1px solid transparent;
+  color: #c9d1d9; font-size: 1rem; cursor: pointer;
+}
+#alerts-menu-btn:hover { background: #21262d; border-color: #30363d; }
+#alerts-badge {
+  position: absolute; top: 2px; right: 2px; min-width: 15px; height: 15px; padding: 0 3px;
+  border-radius: 8px; background: #f85149; color: #fff; font-size: .62rem; font-weight: 700;
+  display: flex; align-items: center; justify-content: center; line-height: 1;
+}
+#alerts-dropdown {
+  position: absolute; top: calc(100% + 8px); right: 0; width: 280px; max-height: 360px; z-index: 900;
+  background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0,0,0,.5); overflow-y: auto; display: none;
+}
+#alerts-menu.open #alerts-dropdown { display: block; }
+#alerts-header {
+  padding: 10px 14px; border-bottom: 1px solid #30363d;
+  font-size: .72rem; font-weight: 700; text-transform: uppercase; letter-spacing: .5px; color: #8b949e;
+  position: sticky; top: 0; background: #161b22;
+}
+.alert-row {
+  display: flex; align-items: center; gap: 8px; padding: 10px 14px; cursor: pointer;
+  border-bottom: 1px solid #21262d; font-size: .8rem; color: #c9d1d9;
+}
+.alert-row:last-child { border-bottom: none; }
+.alert-row:hover { background: #21262d; }
+.alert-row .plan-chip { flex-shrink: 0; }
+#alerts-empty { padding: 16px 14px; font-size: .78rem; color: #8b949e; text-align: center; }
 #user-menu { position: relative; }
 #user-menu-btn {
   display: flex; align-items: center; gap: 8px; height: 36px; padding: 0 10px 0 6px;
@@ -195,6 +226,13 @@ html, body { height: 100%; font-family: 'Segoe UI', sans-serif; background: #0d1
 .card-name  { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: .9rem; }
 .dot        { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
 .card-private { flex-shrink: 0; font-size: .78rem; line-height: 1; }
+.plan-chip {
+  flex-shrink: 0; font-size: .62rem; font-weight: 700; text-transform: uppercase;
+  letter-spacing: .4px; padding: 2px 6px; border-radius: 4px; border: 1px solid;
+}
+.plan-chip.on_track    { color: #3fb950; border-color: #3fb950; background: #0d2b1a; }
+.plan-chip.overdue     { color: #f85149; border-color: #f85149; background: #2b0d0d; }
+.plan-chip.moving_away { color: #e3b341; border-color: #e3b341; background: #2b2000; }
 .card-archive {
   margin-left: auto; flex-shrink: 0; width: 22px; height: 22px;
   background: none; border: 1px solid #30363d; border-radius: 3px;
@@ -283,9 +321,10 @@ html, body { height: 100%; font-family: 'Segoe UI', sans-serif; background: #0d1
 .modal-checklist { max-height: 160px; overflow-y: auto; border: 1px solid #30363d; border-radius: 4px; padding: 8px 10px; margin-top: 4px; }
 .modal-checklist .check-row { display: flex; align-items: center; gap: 8px; font-size: .8rem; color: #c9d1d9; padding: 4px 0; }
 
-/* ── Labels ──────────────────────────────────────────────────────── */
+/* ── Labels / Plan ─────────────────────────────────────────────────── */
+.card-actions { display: flex; gap: 6px; margin-top: 8px; }
 .card-labels-btn {
-  width: 100%; margin-top: 8px; height: 26px; padding: 0 8px;
+  flex: 1; height: 26px; padding: 0 8px;
   background: #0d1117; border: 1px solid #30363d; border-radius: 4px;
   color: #8b949e; font-size: .72rem; cursor: pointer;
 }
@@ -305,6 +344,95 @@ html, body { height: 100%; font-family: 'Segoe UI', sans-serif; background: #0d1
 .btn-mini.danger:hover { border-color: #f85149; color: #f85149; }
 #labels-list { max-height: 260px; overflow-y: auto; margin-bottom: 14px; }
 .labels-empty { color: #8b949e; font-size: .8rem; margin-bottom: 14px; }
+
+/* ── Ask Goby panel ────────────────────────────────────────────────── */
+#ai-toggle-btn {
+  display: flex; align-items: center; gap: 6px; height: 32px; padding: 0 12px;
+  border-radius: 6px; background: #0d2b1a; border: 1px solid #2ea043;
+  color: #3fb950; font-size: .78rem; cursor: pointer; white-space: nowrap;
+}
+#ai-toggle-btn:hover { background: #0f3621; }
+/* Floating, not a docked sidebar — position:fixed takes it out of #main's
+   flex flow entirely, so the map no longer gets squeezed whether this panel
+   is open or closed. `resize: both` + overflow:hidden gives a native
+   browser resize handle (bottom-right corner) for free, no JS needed for
+   resizing; dragging (repositioning) is handled separately in JS via
+   #ai-panel-header's mousedown, since CSS alone can't do that. */
+#ai-panel {
+  position: fixed; top: 80px; left: calc(100% - 420px);
+  width: 400px; height: 520px; min-width: 300px; min-height: 260px;
+  max-width: 90vw; max-height: 85vh;
+  background: #161b22; border: 1px solid #30363d; border-radius: 10px;
+  box-shadow: 0 8px 28px rgba(0,0,0,.5);
+  display: none; flex-direction: column; overflow: hidden; resize: both;
+  z-index: 1500;
+}
+#ai-panel.open { display: flex; }
+#ai-panel-header {
+  padding: 10px 12px; border-bottom: 1px solid #30363d;
+  display: flex; justify-content: space-between; align-items: center;
+  cursor: move; user-select: none; flex-shrink: 0;
+}
+#ai-panel-title { font-size: .85rem; font-weight: 700; color: #3fb950; }
+#ai-panel-header-actions { display: flex; align-items: center; gap: 2px; }
+#ai-messages { flex: 1; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 10px; }
+.ai-msg {
+  font-size: .8rem; line-height: 1.4; padding: 8px 10px; border-radius: 8px;
+  max-width: 92%; white-space: pre-wrap; word-break: break-word;
+}
+.ai-msg.user      { align-self: flex-end; background: #1f6feb; color: #fff; }
+.ai-msg.assistant { align-self: flex-start; background: #0d1117; border: 1px solid #30363d; color: #c9d1d9; }
+.ai-msg.error     { align-self: flex-start; background: #2b0d0d; border: 1px solid #f85149; color: #f85149; }
+.ai-msg table.ai-table { width: 100%; border-collapse: collapse; margin: 4px 0; font-size: .74rem; }
+.ai-msg table.ai-table th, .ai-msg table.ai-table td { border: 1px solid #30363d; padding: 4px 6px; text-align: left; }
+.ai-msg table.ai-table th { background: #161b22; font-weight: 600; }
+.ai-msg ul { margin: 2px 0 2px 18px; padding: 0; }
+#ai-empty { color: #8b949e; font-size: .78rem; padding: 12px; text-align: center; }
+#ai-input-row { border-top: 1px solid #30363d; padding: 10px; display: flex; gap: 8px; flex-shrink: 0; }
+#ai-input {
+  flex: 1; resize: none; height: 38px; max-height: 100px; padding: 8px 10px;
+  background: #0d1117; border: 1px solid #30363d; border-radius: 6px;
+  color: #c9d1d9; font-size: .8rem; font-family: inherit; outline: none;
+}
+#ai-input:focus { border-color: #3fb950; }
+#ai-send-btn {
+  flex-shrink: 0; height: 38px; padding: 0 14px; border-radius: 6px;
+  background: #238636; border: 1px solid #2ea043; color: #fff; font-size: .78rem; cursor: pointer;
+}
+#ai-send-btn:hover { background: #2ea043; }
+#ai-send-btn:disabled { opacity: .5; cursor: default; }
+
+/* ── Smart Tracking plan panel ────────────────────────────────────────
+   Same floating/draggable/resizable treatment as #ai-panel, and for the
+   same reason: the shared backdrop modal was fixed to no longer close on
+   an accidental outside click, but a form you're actively positioning a
+   map pin in deserves to just stay open regardless, the same way the chat
+   panel does. */
+#plan-panel {
+  position: fixed; top: 120px; left: calc(100% - 860px);
+  width: 380px; min-width: 320px; max-width: 90vw; max-height: 85vh;
+  background: #161b22; border: 1px solid #30363d; border-radius: 10px;
+  box-shadow: 0 8px 28px rgba(0,0,0,.5);
+  display: none; flex-direction: column; overflow: hidden; resize: both;
+  z-index: 1500;
+}
+#plan-panel.open { display: flex; }
+#plan-panel-header {
+  padding: 10px 12px; border-bottom: 1px solid #30363d;
+  display: flex; justify-content: space-between; align-items: center;
+  cursor: move; user-select: none; flex-shrink: 0;
+}
+#plan-panel-title { font-size: .85rem; font-weight: 700; color: #3fb950; }
+#plan-panel-body { flex: 1; overflow-y: auto; padding: 12px; }
+#plan-picker-map-wrap { position: relative; margin-bottom: 10px; }
+#plan-picker-map { height: 220px; border: 1px solid #30363d; border-radius: 6px; cursor: crosshair; }
+#plan-picker-coords {
+  position: absolute; bottom: 6px; left: 6px; z-index: 1000;
+  background: rgba(13, 17, 23, .85); border: 1px solid #30363d; border-radius: 4px;
+  padding: 2px 6px; font-size: .7rem; color: #c9d1d9; font-family: 'Consolas', monospace;
+  pointer-events: none;   /* never intercept clicks meant for the map underneath */
+}
+#plan-panel-actions { padding: 10px 12px; border-top: 1px solid #30363d; flex-shrink: 0; margin-bottom: 0; }
 </style>
 </head>
 <body>
@@ -323,6 +451,18 @@ html, body { height: 100%; font-family: 'Segoe UI', sans-serif; background: #0d1
       <div id="live-dot"></div>
       <span id="live-label">connecting…</span>
     </div>
+    <div id="alerts-menu">
+      <button id="alerts-menu-btn" onclick="toggleAlertsMenu(event)" title="Smart Tracking alerts">
+        🔔<span id="alerts-badge" style="display:none;"></span>
+      </button>
+      <div id="alerts-dropdown">
+        <div id="alerts-header">Plan alerts</div>
+        <div id="alerts-list"></div>
+      </div>
+    </div>
+    {% if ai_enabled %}
+    <button id="ai-toggle-btn" onclick="toggleAiPanel()" title="Ask Goby about this tracking data">🐟 Ask Goby (BETA)</button>
+    {% endif %}
     <div id="user-menu">
       <button id="user-menu-btn" onclick="toggleUserMenu(event)">
         <span id="user-avatar"></span>
@@ -379,9 +519,68 @@ html, body { height: 100%; font-family: 'Segoe UI', sans-serif; background: #0d1
     </div>
     <div id="device-list"><div id="empty">No data received yet</div></div>
   </div>
+  {% if ai_enabled %}
+  <div id="ai-panel">
+    <div id="ai-panel-header">
+      <span id="ai-panel-title">🐟 Ask Goby</span>
+      <div id="ai-panel-header-actions">
+        <button class="modal-close-x" onclick="clearAiHistory()" aria-label="Clear chat history" title="Clear chat history">🗑</button>
+        <button class="modal-close-x" onclick="toggleAiPanel()" aria-label="Close" title="Close">✕</button>
+      </div>
+    </div>
+    <div id="ai-messages"><div id="ai-empty">Ask a question about the devices you can see — e.g. "which devices haven't reported recently?"</div></div>
+    <div id="ai-input-row">
+      <textarea id="ai-input" placeholder="Ask about your tracked devices…" onkeydown="onAiInputKeydown(event)"></textarea>
+      <button id="ai-send-btn" onclick="submitAiQuestion()">Send</button>
+    </div>
+  </div>
+  {% endif %}
+  <div id="plan-panel">
+    <div id="plan-panel-header">
+      <span id="plan-panel-title">📍 Plan — <span id="plan-panel-device-name"></span></span>
+      <div id="plan-panel-header-actions">
+        <button class="modal-close-x" onclick="closePlanPanel()" aria-label="Close" title="Close">✕</button>
+      </div>
+    </div>
+    <div id="plan-panel-body" class="modal-body">
+      <div style="color:#8b949e;font-size:.78rem;margin-bottom:10px;">
+        Click the map to set the destination, then set a radius — this is a
+        proximity, not an exact point. Visible to anyone who can already see
+        this device.
+      </div>
+      <div id="plan-picker-map-wrap">
+        <div id="plan-picker-map"></div>
+        <div id="plan-picker-coords"></div>
+      </div>
+      <div style="display:flex;gap:8px;">
+        <div style="flex:1;">
+          <label for="plan-lat">Latitude</label>
+          <input type="number" id="plan-lat" step="0.000001" min="-90" max="90">
+        </div>
+        <div style="flex:1;">
+          <label for="plan-lon">Longitude</label>
+          <input type="number" id="plan-lon" step="0.000001" min="-180" max="180">
+        </div>
+      </div>
+      <label for="plan-radius">Radius (miles)</label>
+      <input type="number" id="plan-radius" min="0.1" step="0.1">
+      <label for="plan-start-date">Plan start date</label>
+      <input type="date" id="plan-start-date">
+      <label for="plan-eta-start">ETA window — from</label>
+      <input type="date" id="plan-eta-start">
+      <label for="plan-eta-end">ETA window — to</label>
+      <input type="date" id="plan-eta-end">
+      <div class="modal-error" id="plan-error"></div>
+    </div>
+    <div id="plan-panel-actions" class="modal-actions">
+      <button type="button" class="btn" id="plan-arrived-btn" onclick="markPlanArrived()" style="display:none;">Mark arrived</button>
+      <button type="button" class="btn danger" id="plan-cancel-btn" onclick="cancelCurrentDevicePlan()" style="display:none;">Cancel plan</button>
+      <button type="button" class="btn primary" onclick="savePlanFromPanel()">Save</button>
+    </div>
+  </div>
 </div>
 
-<div id="modal-backdrop" class="modal-backdrop" style="display:none;" onclick="if (event.target === this) closeModal()">
+<div id="modal-backdrop" class="modal-backdrop" style="display:none;">
   <div class="modal">
     <div class="modal-header">
       <div class="modal-title" id="modal-title"></div>
@@ -405,22 +604,38 @@ L.Icon.Default.mergeOptions({
 
 // ── Map ───────────────────────────────────────────────────────────
 const map = L.map('map').setView([33.30, 44.39], 14);
-{% if basemap_wms_url %}
-// Prod: NGA WMS basemap (set via BASEMAP_WMS_URL env var — see CLAUDE.md).
-L.tileLayer.wms({{ basemap_wms_url | tojson }}, {
-  layers: {{ basemap_wms_layers | tojson }},
-  format: 'image/png',
-  tiled: true,
-  maxZoom: 19,
-  attribution: {{ basemap_attribution | tojson }}
-}).addTo(map);
-{% else %}
-// Dev (default): public OSM raster tiles — no internal network required.
-L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-  attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
-  maxZoom: 19, subdomains: 'abc'
-}).addTo(map);
-{% endif %}
+
+// Factored out so the Smart Tracking plan-picker mini-map (a second,
+// independent Leaflet instance inside a modal) gets the same dev/prod
+// basemap switch as the main map, rather than a second hardcoded copy.
+function addBasemapTiles(targetMap) {
+  {% if basemap_wms_url %}
+  // Prod: NGA WMS basemap (set via BASEMAP_WMS_URL env var — see CLAUDE.md).
+  const wmsBasemap = L.tileLayer.wms({{ basemap_wms_url | tojson }}, {
+    layers: {{ basemap_wms_layers | tojson }},
+    format: 'image/png',
+    tiled: true,
+    maxZoom: 19,
+    attribution: {{ basemap_attribution | tojson }}
+  });
+  wmsBasemap.addTo(targetMap);
+  {% else %}
+  // Dev (default): public OSM raster tiles — no internal network required.
+  // Briefly switched to Esri's World Street Map to get English/bilingual
+  // labels in the Middle East (OSM's standard tiles render purely in local
+  // script there — confirmed live on Baghdad, zero Latin characters) —
+  // reverted back after live use showed Esri's tiles miss real detail
+  // (fewer streets/POIs rendered) that OSM has. The English-label gap this
+  // was trying to solve is still real and unsolved; revisit with a
+  // different approach if it matters enough (e.g. a label-only overlay on
+  // top of OSM, rather than swapping the whole basemap).
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+    maxZoom: 19, subdomains: 'abc'
+  }).addTo(targetMap);
+  {% endif %}
+}
+addBasemapTiles(map);
 
 L.Control.ResetView = L.Control.extend({
   options: { position: 'topleft' },
@@ -462,6 +677,22 @@ const layers  = {};
 let allTracks = [];
 let cachedDevices = [];
 let currentUser = null;
+
+// Every /api/* call goes through this instead of raw fetch() — on a 401
+// (session expired, sliding SESSION_LIFETIME_HOURS timeout) it redirects to
+// /login immediately rather than letting the dashboard sit there silently
+// polling/erroring forever with no indication the session is actually dead.
+// Returns the same Response fetch() would, so existing .then(r => r.json())
+// / r.ok call sites are unchanged — only the 401 short-circuit is new.
+function apiFetch(url, opts) {
+  return fetch(url, opts).then(res => {
+    if (res.status === 401) {
+      window.location.href = '/login?next=' + encodeURIComponent(window.location.pathname);
+      throw new Error('session expired');
+    }
+    return res;
+  });
+}
 
 // Drill-down: at most one device's full trail is ever shown at a time.
 // Overview (selectedDevice === null) shows only latest-position markers.
@@ -554,11 +785,26 @@ function windowLabel(days) {
 // (row list), reapplyHighlight()/highlightFix() (index resolution), and
 // bounds-fitting — keeps crumb indices and log-row indices consistent since
 // both are always built from the identical windowed array in the same pass.
+// start_date of the drilled-in device's active plan (if any) — an extra
+// lower bound getVisiblePoints() applies on top of whichever 7d/30d/90d/All
+// window is selected, so a device reused under a new plan never shows its
+// PREVIOUS plan's trail mixed in, regardless of window. Set by
+// drawPlanOverlay()/cleared by removePlanOverlay(), which already run on
+// every drill-in/switch/exit — see selectDevice()/exitDetail().
+let currentDrilledPlanStartDate = null;
+
 function getVisiblePoints(track) {
   const points = track?.points || [];
-  if (windowDays === 'all') return points;
-  const cutoff = Date.now() - windowDays * 86400000;
-  return points.filter(p => tsToMs(p.timestamp) >= cutoff);
+  let result = points;
+  if (windowDays !== 'all') {
+    const cutoff = Date.now() - windowDays * 86400000;
+    result = result.filter(p => tsToMs(p.timestamp) >= cutoff);
+  }
+  if (currentDrilledPlanStartDate && track?.uuid === selectedDevice) {
+    const planCutoffMs = new Date(currentDrilledPlanStartDate + 'T00:00:00Z').getTime();
+    result = result.filter(p => tsToMs(p.timestamp) >= planCutoffMs);
+  }
+  return result;
 }
 
 // Fits the map to a given point set. No-ops if empty so switching to a
@@ -592,6 +838,7 @@ function selectDevice(uuid) {
   const track = allTracks.find(t => t.uuid === uuid);
   if (!track?.points?.length) return;
 
+  removePlanOverlay();   // clear whatever device was previously drilled into, before drawing the new one
   selectedDevice = uuid;
   highlightedIdx = null;
   windowDays = 30;              // every fresh drill-down starts at the 30-day default
@@ -605,6 +852,7 @@ function selectDevice(uuid) {
   document.getElementById('detailbar').style.display  = 'flex';
 
   fitToPoints(getVisiblePoints(track));
+  drawPlanOverlay(uuid);
 }
 
 // Called by the view-mode toggle buttons. Re-renders the drilled-in device
@@ -633,6 +881,7 @@ function setWindow(pos) {
 }
 
 function exitDetail() {
+  removePlanOverlay();
   selectedDevice = null;
   highlightedIdx = null;
   renderTracks(allTracks);   // repopulates layers with every device now that selectedDevice is null
@@ -648,13 +897,13 @@ function archiveSelected() {
 async function archiveDevice(evt, uuid) {
   evt?.stopPropagation();
   if (selectedDevice === uuid) exitDetail();
-  await fetch(`/api/devices/${uuid}/archive`, { method: 'POST' });
+  await apiFetch(`/api/devices/${uuid}/archive`, { method: 'POST' });
   await loadAll();
 }
 
 async function unarchiveDevice(evt, uuid) {
   evt?.stopPropagation();
-  await fetch(`/api/devices/${uuid}/unarchive`, { method: 'POST' });
+  await apiFetch(`/api/devices/${uuid}/unarchive`, { method: 'POST' });
   showArchived = false;
   await loadAll();
 }
@@ -669,7 +918,7 @@ async function setArchivedView(want) {
 // The archived list is fetched on demand (not kept live) — it's a
 // management view, not something that needs to track incoming fixes.
 async function renderArchived() {
-  const devices = await fetch('/api/devices?archived=1').then(r => r.json());
+  const devices = await apiFetch('/api/devices?archived=1').then(r => r.json());
 
   document.getElementById('panel-title').style.display = 'none';
   document.getElementById('view-tabs-wrap').style.display = 'flex';
@@ -835,6 +1084,16 @@ function escapeHtml(s) {
   return (s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
+// Smart Tracking stage 2 — d.plan_status comes straight from /api/devices
+// (computed server-side in _visible_devices(), never the model — see
+// CLAUDE.md). null for a device with no plan, in which case no chip shows
+// at all, same as the private-device lock icon.
+const PLAN_STATUS_LABELS = { on_track: 'On track', overdue: '⚠ Overdue', moving_away: '⚠ Moving away' };
+function planStatusChipHtml(status) {
+  if (!status || !PLAN_STATUS_LABELS[status]) return '';
+  return `<span class="plan-chip ${status}" title="Smart Tracking plan status">${PLAN_STATUS_LABELS[status]}</span>`;
+}
+
 function deviceCardHtml(d) {
   const color    = getColor(d);
   const isActive = d.uuid === selectedDevice;
@@ -846,6 +1105,7 @@ function deviceCardHtml(d) {
       <div class="dot" style="background:${color}"></div>
       ${d.name}
       ${d.private ? '<span class="card-private" title="Private device — visible only to specifically granted users">🔒</span>' : ''}
+      ${planStatusChipHtml(d.plan_status)}
       ${currentUser?.is_admin ? `<button class="card-archive" onclick="archiveDevice(event,'${d.uuid}')" title="Archive device">🗄</button>` : ''}
     </div>
     <div class="card-uuid">${d.uuid}</div>
@@ -856,7 +1116,10 @@ function deviceCardHtml(d) {
       <span><span class="stat-val">${ago(d.last_seen)}</span></span>
     </div>
     <div class="card-lastseen">${d.last_seen || '—'}</div>
-    <button class="card-labels-btn" onclick="event.stopPropagation(); openDeviceLabels('${d.uuid}', '${d.name.replace(/'/g, "\\'")}')">🏷 Labels</button>
+    <div class="card-actions">
+      <button class="card-labels-btn" onclick="event.stopPropagation(); openDeviceLabels('${d.uuid}', '${d.name.replace(/'/g, "\\'")}')">🏷 Labels</button>
+      <button class="card-labels-btn" onclick="event.stopPropagation(); openDevicePlan('${d.uuid}', '${d.name.replace(/'/g, "\\'")}')">📍 Plan</button>
+    </div>
   </div>`;
 }
 
@@ -875,7 +1138,7 @@ let labelGrantCandidates = null;   // cached group-members list for whichever la
 async function openDeviceLabels(uuid, name) {
   labelGrantCandidates = null;
   let labels = [];
-  try { labels = await fetch(`/api/devices/${uuid}/labels`).then(r => r.json()); } catch (e) {}
+  try { labels = await apiFetch(`/api/devices/${uuid}/labels`).then(r => r.json()); } catch (e) {}
   renderLabelsModal(uuid, name, labels);
 }
 
@@ -907,7 +1170,7 @@ function renderLabelsModal(uuid, name, labels) {
       const priv = document.getElementById('new-label-private').checked;
       const user_ids = priv ? checkedGrantIds('new-label-grant-list') : [];
       try {
-        const res = await fetch(`/api/devices/${uuid}/labels`, {
+        const res = await apiFetch(`/api/devices/${uuid}/labels`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ text, private: priv, user_ids }),
         });
@@ -935,7 +1198,7 @@ async function onLabelPrivateToggle(uuid, areaId, listId, checked, checkedIds) {
   if (!labelGrantCandidates) {
     listEl.innerHTML = '<p style="color:#8b949e;margin:0;">Loading…</p>';
     try {
-      labelGrantCandidates = await fetch(`/api/devices/${uuid}/group-members`).then(r => r.json());
+      labelGrantCandidates = await apiFetch(`/api/devices/${uuid}/group-members`).then(r => r.json());
     } catch (e) {
       labelGrantCandidates = [];
       listEl.innerHTML = '<p style="color:#f85149;margin:0;">Failed to load group members</p>';
@@ -971,7 +1234,7 @@ function labelRowHtml(uuid, name, l) {
 
 function deleteLabel(uuid, name, labelId) {
   openConfirm('Delete label', 'Delete this label? This cannot be undone.', async () => {
-    try { await fetch(`/api/labels/${labelId}`, { method: 'DELETE' }); } catch (e) {}
+    try { await apiFetch(`/api/labels/${labelId}`, { method: 'DELETE' }); } catch (e) {}
     openDeviceLabels(uuid, name);
     return false;
   });
@@ -980,7 +1243,7 @@ function deleteLabel(uuid, name, labelId) {
 async function openEditLabel(uuid, name, labelId) {
   labelGrantCandidates = null;
   let labels = [];
-  try { labels = await fetch(`/api/devices/${uuid}/labels`).then(r => r.json()); } catch (e) {}
+  try { labels = await apiFetch(`/api/devices/${uuid}/labels`).then(r => r.json()); } catch (e) {}
   const label = labels.find(l => l.id === labelId);
   if (!label) { openDeviceLabels(uuid, name); return; }
   const currentIds = (label.allowed_users || []).map(u => u.id);
@@ -1007,7 +1270,7 @@ async function openEditLabel(uuid, name, labelId) {
       const priv = document.getElementById('edit-label-private').checked;
       const user_ids = priv ? checkedGrantIds('edit-label-grant-list') : [];
       try {
-        const res = await fetch(`/api/labels/${labelId}`, {
+        const res = await apiFetch(`/api/labels/${labelId}`, {
           method: 'PATCH', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ text, private: priv, user_ids }),
         });
@@ -1073,6 +1336,11 @@ function toggleGroupExpanded(key) {
 function renderPanel(devices) {
   if (devices) cachedDevices = devices;
   else devices = cachedDevices;
+
+  // Runs on every /api/devices refresh regardless of what's currently shown
+  // (drilled-in, archived view, etc.) — alerts should stay current even
+  // while looking at one specific device.
+  renderAlertsMenu(devices);
 
   if (selectedDevice) { renderLog(); return; }
   if (showArchived) return;   // archived view manages its own fetch/render
@@ -1155,6 +1423,182 @@ function renderLog() {
   }).reverse().join('');
 }
 
+// ── Smart Tracking: Plan (stage 1 — plan-setting + the map circle only;
+// status/alerts are a later, separate stage, not built yet) ────────────
+// A plan is entirely optional per device — its mere existence IS the
+// opt-in, there's no separate enable/disable flag to keep in sync. The
+// destination is a PROXIMITY (center + radius), deliberately never an exact
+// point, for the same reason the destination itself is sensitive — see
+// CLAUDE.md. Anyone who can already see a device can set/view/cancel its
+// plan, same permission level as a public label.
+let planPickerMap = null, planPickerMarker = null, planPickerCircle = null;
+let planOverlayCircle = null;   // the destination circle drawn on the MAIN map while drilled into a device with a plan
+let currentPlanUuid = null, currentPlanName = null;   // which device the floating #plan-panel is currently open for
+
+// Floating/draggable/resizable, same treatment as #ai-panel — NOT the
+// shared backdrop modal, specifically so it can stay open while you look
+// around the map instead of vanishing on an accidental outside click (the
+// thing the shared modal system itself was just fixed for separately).
+async function openDevicePlan(uuid, name) {
+  currentPlanUuid = uuid;
+  currentPlanName = name;
+  let plan = null;
+  try { plan = await apiFetch(`/api/devices/${uuid}/plan`).then(r => r.json()); } catch (e) {}
+
+  document.getElementById('plan-panel-device-name').textContent = name;
+  document.getElementById('plan-error').textContent = '';
+  document.getElementById('plan-radius').value = plan?.radius_miles ?? '';
+  // Defaults to today (UTC, matching the backend's own default when this is
+  // omitted) for a brand-new plan — most plans are declared the moment
+  // they actually begin, so this is a non-issue for the common case;
+  // editable for a plan declared ahead of actual departure, or to
+  // deliberately reset the progress-trend baseline when reusing a device
+  // under a new plan without changing its destination/ETA.
+  document.getElementById('plan-start-date').value = plan?.start_date || new Date().toISOString().slice(0, 10);
+  document.getElementById('plan-eta-start').value = plan?.eta_start ?? '';
+  document.getElementById('plan-eta-end').value = plan?.eta_end ?? '';
+  document.getElementById('plan-cancel-btn').style.display = plan ? '' : 'none';
+  document.getElementById('plan-arrived-btn').style.display = plan ? '' : 'none';
+  document.getElementById('plan-panel').classList.add('open');
+
+  const defaultLat = plan?.dest_lat ?? map.getCenter().lat;
+  const defaultLon = plan?.dest_lon ?? map.getCenter().lng;
+  const defaultRadius = plan?.radius_miles ?? 10;
+  if (!planPickerMap) {
+    planPickerMap = L.map('plan-picker-map').setView([defaultLat, defaultLon], plan ? 9 : 6);
+    addBasemapTiles(planPickerMap);
+    planPickerMarker = L.marker([defaultLat, defaultLon], { draggable: true }).addTo(planPickerMap);
+    planPickerCircle = L.circle([defaultLat, defaultLon], {
+      radius: defaultRadius * 1609.344, color: '#3fb950', weight: 1, fillOpacity: 0.1,
+    }).addTo(planPickerMap);
+    // The marker position is the single source of truth for the destination —
+    // clicking the map, dragging the marker, and typing lat/lon are three
+    // different ways to move the SAME marker, not three separate values to
+    // reconcile. savePlanFromPanel() only ever reads the marker's position.
+    const syncFromMarker = () => {
+      const pos = planPickerMarker.getLatLng();
+      planPickerCircle.setLatLng(pos);
+      const r = parseFloat(document.getElementById('plan-radius').value) || defaultRadius;
+      planPickerCircle.setRadius(r * 1609.344);
+      document.getElementById('plan-lat').value = pos.lat.toFixed(6);
+      document.getElementById('plan-lon').value = pos.lng.toFixed(6);
+    };
+    const syncFromLatLonInputs = () => {
+      const lat = parseFloat(document.getElementById('plan-lat').value);
+      const lon = parseFloat(document.getElementById('plan-lon').value);
+      if (!isFinite(lat) || !isFinite(lon) || lat < -90 || lat > 90 || lon < -180 || lon > 180) return;
+      planPickerMarker.setLatLng([lat, lon]);
+      planPickerCircle.setLatLng([lat, lon]);
+      planPickerMap.panTo([lat, lon]);
+    };
+    planPickerMarker.on('drag', syncFromMarker);
+    planPickerMap.on('click', (e) => { planPickerMarker.setLatLng(e.latlng); syncFromMarker(); });
+    document.getElementById('plan-radius').addEventListener('input', syncFromMarker);
+    // Live cursor coordinates — purely a visual aid, moving the mouse never
+    // touches the marker/destination; only an actual click does that.
+    planPickerMap.on('mousemove', (e) => {
+      document.getElementById('plan-picker-coords').textContent = `${e.latlng.lat.toFixed(5)}, ${e.latlng.lng.toFixed(5)}`;
+    });
+    planPickerMap.on('mouseout', () => {
+      document.getElementById('plan-picker-coords').textContent = '';
+    });
+    document.getElementById('plan-lat').addEventListener('change', syncFromLatLonInputs);
+    document.getElementById('plan-lon').addEventListener('change', syncFromLatLonInputs);
+  } else {
+    planPickerMap.invalidateSize();   // the panel may have been resized/closed since this map last rendered
+    planPickerMap.setView([defaultLat, defaultLon], plan ? 9 : 6);
+    planPickerMarker.setLatLng([defaultLat, defaultLon]);
+    planPickerCircle.setLatLng([defaultLat, defaultLon]);
+    planPickerCircle.setRadius(defaultRadius * 1609.344);
+  }
+  document.getElementById('plan-lat').value = defaultLat.toFixed(6);
+  document.getElementById('plan-lon').value = defaultLon.toFixed(6);
+}
+
+function closePlanPanel() {
+  document.getElementById('plan-panel').classList.remove('open');
+}
+
+// ALL fields required, client AND server side — a plan with a missing ETA
+// or radius is half-declared and not meaningfully trackable, so there's no
+// "optional field" here the way Labels' private-grant list is optional.
+async function savePlanFromPanel() {
+  const errEl = document.getElementById('plan-error');
+  if (!planPickerMarker) { errEl.textContent = 'Click the map to set a destination first'; return; }
+  const radius_miles = parseFloat(document.getElementById('plan-radius').value);
+  if (!radius_miles || radius_miles <= 0) { errEl.textContent = 'Radius is required'; return; }
+  const start_date = document.getElementById('plan-start-date').value;
+  if (!start_date) { errEl.textContent = 'Plan start date is required'; return; }
+  const eta_start = document.getElementById('plan-eta-start').value;
+  const eta_end = document.getElementById('plan-eta-end').value;
+  if (!eta_start || !eta_end) { errEl.textContent = 'Both ETA dates are required'; return; }
+  const pos = planPickerMarker.getLatLng();
+  try {
+    const res = await apiFetch(`/api/devices/${currentPlanUuid}/plan`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dest_lat: pos.lat, dest_lon: pos.lng, radius_miles, start_date, eta_start, eta_end }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) { errEl.textContent = data.error || 'Failed to save plan'; return; }
+  } catch (e) { errEl.textContent = 'Failed to save plan'; return; }
+  if (currentPlanUuid === selectedDevice) drawPlanOverlay(currentPlanUuid);
+  closePlanPanel();
+}
+
+// Manual close-out, per the original Smart Tracking design decision — no
+// automatic "arrived" detection exists (no geofence-triggered close-out),
+// only this and "Cancel plan". Both end up deleting the same live plan row;
+// the only difference is which `outcome` gets recorded in its permanent
+// device_plan_history entry (see delete_device_plan()).
+function deleteCurrentPlan(outcome, title, message, confirmLabel, danger) {
+  openConfirm(title, message, async () => {
+    try {
+      await apiFetch(`/api/devices/${currentPlanUuid}/plan`, {
+        method: 'DELETE', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ outcome }),
+      });
+    } catch (e) {}
+    if (currentPlanUuid === selectedDevice) removePlanOverlay();
+    closePlanPanel();
+  }, confirmLabel, danger);
+}
+
+function markPlanArrived() {
+  deleteCurrentPlan('arrived', 'Mark arrived',
+    `This marks ${escapeHtml(currentPlanName)} as having reached its destination and removes the active plan. This cannot be undone, but the plan's history is kept.`,
+    'Mark arrived', false);
+}
+
+function cancelCurrentDevicePlan() {
+  deleteCurrentPlan('cancelled', 'Cancel plan',
+    `This removes ${escapeHtml(currentPlanName)}'s declared destination. This cannot be undone, but the plan's history is kept.`,
+    'Cancel plan', true);
+}
+
+function removePlanOverlay() {
+  if (planOverlayCircle) { map.removeLayer(planOverlayCircle); planOverlayCircle = null; }
+  currentDrilledPlanStartDate = null;
+}
+
+async function drawPlanOverlay(uuid) {
+  removePlanOverlay();
+  let plan = null;
+  try { plan = await apiFetch(`/api/devices/${uuid}/plan`).then(r => r.json()); } catch (e) {}
+  if (!plan || uuid !== selectedDevice) return;   // guard against a race if the device changed while this was in flight
+  planOverlayCircle = L.circle([plan.dest_lat, plan.dest_lon], {
+    radius: plan.radius_miles * 1609.344, color: '#3fb950', weight: 2, dashArray: '6,4', fillOpacity: 0.08,
+  }).addTo(map).bindTooltip(`Declared destination (~${plan.radius_miles} mi radius)`);
+  // selectDevice() already rendered the track/log once, before this async
+  // fetch resolved, using the old/unscoped point set — re-render now that
+  // the plan's start_date is actually known, and refit the view to match
+  // (the whole point is the previous plan's trail shouldn't be visible).
+  currentDrilledPlanStartDate = plan.start_date;
+  renderTracks(allTracks);
+  renderLog();
+  const track = allTracks.find(t => t.uuid === uuid);
+  if (track) fitToPoints(getVisiblePoints(track));
+}
+
 // ── Navigation ────────────────────────────────────────────────────
 function resetView() {
   const latlngs = Object.values(layers).map(l => l.marker.getLatLng());
@@ -1198,8 +1642,8 @@ function closeModal() {
   document.getElementById('modal-backdrop').style.display = 'none';
 }
 
-function openConfirm(title, message, onConfirm) {
-  openModal(title, `<p>${message}</p>`, { confirmLabel: 'Delete', danger: true, onConfirm });
+function openConfirm(title, message, onConfirm, confirmLabel = 'Delete', danger = true) {
+  openModal(title, `<p>${message}</p>`, { confirmLabel, danger, onConfirm });
 }
 
 document.addEventListener('keydown', (e) => {
@@ -1224,7 +1668,7 @@ function openChangePassword() {
       const errEl = document.getElementById('modal-pw-error');
       if (!new_password) { errEl.textContent = 'New password is required'; return false; }
       try {
-        const res = await fetch('/api/change-password', {
+        const res = await apiFetch('/api/change-password', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ current_password, new_password }),
@@ -1269,8 +1713,52 @@ document.addEventListener('click', (e) => {
   if (menu.classList.contains('open') && !menu.contains(e.target)) closeUserMenu();
 });
 
+// Smart Tracking stage 3 — purely a client-side view over d.plan_status,
+// already present in every /api/devices response (same field the device-
+// card chip reads). No new endpoint; renderAlertsMenu() is called from
+// renderPanel() on every refresh (SSE push or the existing 30s poll), so
+// this updates live with zero new plumbing, same as the chip itself.
+function toggleAlertsMenu(evt) {
+  evt?.stopPropagation();
+  document.getElementById('alerts-menu').classList.toggle('open');
+}
+
+function closeAlertsMenu() {
+  document.getElementById('alerts-menu').classList.remove('open');
+}
+
+document.addEventListener('click', (e) => {
+  const menu = document.getElementById('alerts-menu');
+  if (menu.classList.contains('open') && !menu.contains(e.target)) closeAlertsMenu();
+});
+
+function renderAlertsMenu(devices) {
+  const alerting = (devices || []).filter(d => d.plan_status === 'overdue' || d.plan_status === 'moving_away');
+  const badge = document.getElementById('alerts-badge');
+  if (alerting.length) {
+    badge.textContent = alerting.length > 99 ? '99+' : String(alerting.length);
+    badge.style.display = 'flex';
+  } else {
+    badge.style.display = 'none';
+  }
+  const list = document.getElementById('alerts-list');
+  if (!alerting.length) {
+    list.innerHTML = '<div id="alerts-empty">No active plan alerts</div>';
+    return;
+  }
+  // Overdue first — it's the more directly actionable signal, same priority
+  // order _compute_plan_status() itself uses when a device is somehow both.
+  const sorted = [...alerting].sort((a, b) => (a.plan_status === 'overdue' ? -1 : 1) - (b.plan_status === 'overdue' ? -1 : 1));
+  list.innerHTML = sorted.map(d => `
+    <div class="alert-row" onclick="closeAlertsMenu(); selectDevice('${d.uuid}');">
+      <span>${escapeHtml(d.name)}</span>
+      ${planStatusChipHtml(d.plan_status)}
+    </div>
+  `).join('');
+}
+
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') closeUserMenu();
+  if (e.key === 'Escape') { closeUserMenu(); closeAlertsMenu(); }
 });
 
 async function logout() {
@@ -1280,9 +1768,9 @@ async function logout() {
 
 async function loadAll() {
   const [tracks, devices, me] = await Promise.all([
-    fetch('/api/tracks').then(r => r.json()),
-    fetch('/api/devices').then(r => r.json()),
-    fetch('/api/me').then(r => r.json()),
+    apiFetch('/api/tracks').then(r => r.json()),
+    apiFetch('/api/devices').then(r => r.json()),
+    apiFetch('/api/me').then(r => r.json()),
   ]);
   currentUser = me;
   syncUserUI();
@@ -1297,7 +1785,18 @@ function connectSSE() {
   const label = document.getElementById('live-label');
   const es    = new EventSource('/stream');
   es.onopen  = () => { dot.className = 'on'; label.textContent = 'Live'; };
-  es.onerror = () => { dot.className = ''; label.textContent = 'reconnecting…'; es.close(); setTimeout(connectSSE, 5000); };
+  es.onerror = () => {
+    dot.className = ''; label.textContent = 'reconnecting…'; es.close();
+    // EventSource gives no HTTP status on error, so a 401 (session expired)
+    // looks identical to a plain network blip — probe /api/me directly
+    // (not apiFetch, since we want to keep retrying on anything OTHER than
+    // a confirmed 401, including this probe itself failing) to tell them
+    // apart before deciding to retry forever vs. send the user to /login.
+    fetch('/api/me').then(res => {
+      if (res.status === 401) window.location.href = '/login?next=' + encodeURIComponent(window.location.pathname);
+      else setTimeout(connectSSE, 5000);
+    }).catch(() => setTimeout(connectSSE, 5000));
+  };
   es.onmessage = e => {
     for (const obs of JSON.parse(e.data)) {
       let track = allTracks.find(t => t.uuid === obs.uuid);
@@ -1315,12 +1814,250 @@ function connectSSE() {
       }
     }
     renderTracks(allTracks);
-    fetch('/api/devices').then(r => r.json()).then(renderPanel);
+    apiFetch('/api/devices').then(r => r.json()).then(renderPanel);
   };
 }
 
-setInterval(() => fetch('/api/devices').then(r => r.json()).then(renderPanel), 30000);
+setInterval(() => apiFetch('/api/devices').then(r => r.json()).then(renderPanel), 30000);
 loadAll().then(connectSSE);
+
+{% if ai_enabled %}
+// ── Ask Goby ──────────────────────────────────────────────────────
+// Streamed via fetch()+ReadableStream, not EventSource — EventSource is
+// GET-only and can't carry the growing conversation body each turn.
+//
+// Assistant bubbles render a narrow, safe markdown subset (bold + tables +
+// simple bullet lists) via formatAiText() — NOT a general markdown library.
+// The whole input is HTML-escaped first (escapeHtml()), and only THEN are a
+// few specific patterns re-introduced as real tags; since no real tag can
+// exist in the string before that point, the only HTML that ever reaches
+// innerHTML is what we deliberately generated from a known-safe pattern.
+// Model output is still untrusted — this is why we escape-then-whitelist
+// rather than ever handing raw model text to innerHTML directly. User
+// bubbles and error bubbles are unaffected — plain textContent, as before.
+function formatInline(line) {
+  return escapeHtml(line).replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+}
+
+function splitTableRow(line) {
+  return line.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map(c => c.trim());
+}
+
+function renderAiTable(headerLine, bodyLines) {
+  let html = '<table class="ai-table"><thead><tr>';
+  for (const h of splitTableRow(headerLine)) html += `<th>${formatInline(h)}</th>`;
+  html += '</tr></thead><tbody>';
+  for (const row of bodyLines) {
+    html += '<tr>' + splitTableRow(row).map(c => `<td>${formatInline(c)}</td>`).join('') + '</tr>';
+  }
+  return html + '</tbody></table>';
+}
+
+function formatAiText(text) {
+  const lines = (text ?? '').split('\n');
+  const isTableRow = (l) => /^\s*\|.*\|\s*$/.test(l);
+  const isTableSep = (l) => /^\s*\|[\s:-]+\|[\s:|-]*$/.test(l);
+  let html = '', i = 0;
+  while (i < lines.length) {
+    if (isTableRow(lines[i]) && i + 1 < lines.length && isTableSep(lines[i + 1])) {
+      const header = lines[i];
+      let j = i + 2, body = [];
+      while (j < lines.length && isTableRow(lines[j])) { body.push(lines[j]); j++; }
+      html += renderAiTable(header, body);
+      i = j;
+      continue;
+    }
+    const m = lines[i].match(/^\s*[*-]\s+(.*)$/);
+    if (m) {
+      let j = i, items = [];
+      while (j < lines.length && lines[j].match(/^\s*[*-]\s+(.*)$/)) {
+        items.push(lines[j].match(/^\s*[*-]\s+(.*)$/)[1]);
+        j++;
+      }
+      html += '<ul>' + items.map(it => `<li>${formatInline(it)}</li>`).join('') + '</ul>';
+      i = j;
+      continue;
+    }
+    html += formatInline(lines[i]) + '<br>';
+    i++;
+  }
+  return html;
+}
+let aiMessages = [];   // [{role, content}, ...] — the running conversation for this panel session
+let aiHistoryLoaded = false;
+
+function toggleAiPanel() {
+  const panel = document.getElementById('ai-panel');
+  panel.classList.toggle('open');
+  if (panel.classList.contains('open')) {
+    if (!aiHistoryLoaded) loadAiHistory();
+    document.getElementById('ai-input').focus();
+  }
+}
+
+async function loadAiHistory() {
+  aiHistoryLoaded = true;
+  try {
+    const rows = await apiFetch('/api/ai/history').then(r => r.json());
+    aiMessages = rows.map(r => ({ role: r.role, content: r.content }));
+    renderAiMessages();
+  } catch (e) {}
+}
+
+function clearAiHistory() {
+  if (!aiMessages.length) return;  // nothing to clear, don't bother confirming
+  openConfirm(
+    'Clear chat history',
+    'This permanently deletes your Ask Goby conversation history. This cannot be undone.',
+    async () => {
+      try { await apiFetch('/api/ai/history', { method: 'DELETE' }); } catch (e) {}
+      aiMessages = [];
+      renderAiMessages();
+    },
+  );
+}
+
+function renderAiMessages() {
+  const el = document.getElementById('ai-messages');
+  el.innerHTML = '';
+  if (!aiMessages.length) {
+    el.innerHTML = '<div id="ai-empty">Ask a question about the devices you can see — e.g. "which devices haven\'t reported recently?"</div>';
+    return;
+  }
+  for (const m of aiMessages) appendAiBubble(m.role, m.content);
+}
+
+function appendAiBubble(role, text) {
+  const el = document.getElementById('ai-messages');
+  const empty = document.getElementById('ai-empty');
+  if (empty) empty.remove();
+  const bubble = document.createElement('div');
+  bubble.className = 'ai-msg ' + role;
+  setAiBubbleText(bubble, role, text);
+  el.appendChild(bubble);
+  el.scrollTop = el.scrollHeight;
+  return bubble;
+}
+
+function setAiBubbleText(bubble, role, text) {
+  if (role === 'assistant' && text) {
+    bubble.innerHTML = formatAiText(text);
+  } else {
+    bubble.textContent = text;
+  }
+}
+
+function onAiInputKeydown(e) {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    submitAiQuestion();
+  }
+}
+
+async function submitAiQuestion() {
+  const input = document.getElementById('ai-input');
+  const question = input.value.trim();
+  if (!question) return;
+  const sendBtn = document.getElementById('ai-send-btn');
+  input.value = '';
+  input.disabled = true;
+  sendBtn.disabled = true;
+
+  aiMessages.push({ role: 'user', content: question });
+  appendAiBubble('user', question);
+  const assistantBubble = appendAiBubble('assistant', '');
+
+  try {
+    const resp = await fetch('/api/ai/ask', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messages: aiMessages.slice(-12) }),
+    });
+    if (resp.status === 401) {
+      window.location.href = '/login?next=' + encodeURIComponent(window.location.pathname);
+      return;
+    }
+    if (!resp.ok || !resp.body) {
+      const data = await resp.json().catch(() => ({}));
+      assistantBubble.className = 'ai-msg error';
+      assistantBubble.textContent = data.error || `Request failed (${resp.status})`;
+      return;
+    }
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '', full = '', gotError = false;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf('\n\n')) !== -1) {
+        const line = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        if (!line.startsWith('data: ')) continue;
+        const raw = line.slice(6);
+        if (raw === '[DONE]') continue;
+        let evt;
+        try { evt = JSON.parse(raw); } catch (e) { continue; }
+        if (evt.error) {
+          gotError = true;
+          assistantBubble.className = 'ai-msg error';
+          assistantBubble.textContent = evt.error;
+        } else if (evt.delta) {
+          full += evt.delta;
+          setAiBubbleText(assistantBubble, 'assistant', full);
+          document.getElementById('ai-messages').scrollTop = document.getElementById('ai-messages').scrollHeight;
+        }
+      }
+    }
+    if (!gotError) aiMessages.push({ role: 'assistant', content: full });
+  } catch (e) {
+    assistantBubble.className = 'ai-msg error';
+    assistantBubble.textContent = 'Connection to Goby failed.';
+  } finally {
+    input.disabled = false;
+    sendBtn.disabled = false;
+    input.focus();
+  }
+}
+
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    const panel = document.getElementById('ai-panel');
+    if (panel && panel.classList.contains('open')) panel.classList.remove('open');
+  }
+});
+
+makePanelDraggable('ai-panel', 'ai-panel-header');
+{% endif %}
+
+// Shared by every floating panel (#ai-panel, #plan-panel) — defined
+// unconditionally since #plan-panel exists regardless of ai_enabled.
+// Resizing is handled natively by CSS `resize: both` on the panel itself,
+// no JS needed for that half; this only handles dragging by the header.
+function makePanelDraggable(panelId, headerId) {
+  const panel = document.getElementById(panelId);
+  const header = document.getElementById(headerId);
+  let dragging = false, startX = 0, startY = 0, startLeft = 0, startTop = 0;
+  header.addEventListener('mousedown', (e) => {
+    if (e.target.closest('button')) return;  // don't drag when clicking a header button (🗑/✕)
+    dragging = true;
+    startX = e.clientX; startY = e.clientY;
+    const rect = panel.getBoundingClientRect();
+    startLeft = rect.left; startTop = rect.top;
+    e.preventDefault();
+  });
+  document.addEventListener('mousemove', (e) => {
+    if (!dragging) return;
+    const rect = panel.getBoundingClientRect();
+    const maxLeft = Math.max(0, window.innerWidth - rect.width);
+    const maxTop = Math.max(0, window.innerHeight - rect.height);
+    panel.style.left = Math.min(maxLeft, Math.max(0, startLeft + (e.clientX - startX))) + 'px';
+    panel.style.top = Math.min(maxTop, Math.max(0, startTop + (e.clientY - startY))) + 'px';
+  });
+  document.addEventListener('mouseup', () => { dragging = false; });
+}
+makePanelDraggable('plan-panel', 'plan-panel-header');
 </script>
 </body>
 </html>

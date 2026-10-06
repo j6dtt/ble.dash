@@ -278,6 +278,17 @@ input[type="color"] {
 
   <section>
     <div class="section-header">
+      <h2>Active Now</h2>
+      <span id="active-users-count" class="setting-hint"></span>
+    </div>
+    <div class="setting-hint" style="margin-bottom:8px;">
+      Users seen in the last few minutes — activity-based (any authenticated page load or API call), not a real session list; there's no server-side session store to query. Refreshes automatically.
+    </div>
+    <div id="active-users-list"></div>
+  </section>
+
+  <section>
+    <div class="section-header">
       <h2>Users</h2>
       <button class="btn-primary" onclick="openAddUser()">+ Add user</button>
     </div>
@@ -343,10 +354,21 @@ input[type="color"] {
     </div>
   </section>
 
+  <section id="ai-settings-section" style="display:none;">
+    <div class="section-header">
+      <h2>AI Assistant (Ask Goby)</h2>
+    </div>
+    <div class="setting-hint" style="margin-bottom:8px;">
+      Visible only to the super admin. Turning this off immediately hides Ask Goby for every user and blocks new questions — existing conversation history is kept either way.
+    </div>
+    <div id="ai-settings-status" class="setting-hint" style="margin-bottom:8px;"></div>
+    <button id="ai-settings-toggle-btn" onclick="toggleAiEnabled()"></button>
+  </section>
+
   <div id="version-info"></div>
 </div>
 
-<div id="modal-backdrop" class="modal-backdrop" style="display:none;" onclick="if (event.target === this) closeModal()">
+<div id="modal-backdrop" class="modal-backdrop" style="display:none;">
   <div class="modal">
     <div class="modal-header">
       <div class="modal-title" id="modal-title"></div>
@@ -382,6 +404,16 @@ async function api(path, opts) {
     headers: { 'Content-Type': 'application/json' },
     ...opts,
   });
+  if (res.status === 401) {
+    // Session expired (sliding SESSION_LIFETIME_HOURS timeout) — every call
+    // here goes through this one helper, so this single check is enough to
+    // bounce the whole page to /login instead of leaving Management sitting
+    // there with every action silently failing (previously: loadActiveUsers'
+    // 30s poll just swallowed this as "non-critical" forever, same bug as
+    // index.html's dashboard loop had).
+    window.location.href = '/login?next=' + encodeURIComponent(window.location.pathname);
+    throw new Error('session expired');
+  }
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
   return data;
@@ -642,6 +674,7 @@ function renderUsers() {
           <button class="btn" onclick="editUserName(${u.id})">Edit name</button>
           <button class="btn" onclick="editUserGroups(${u.id})">Edit groups</button>
           ${isSelfSuperAdmin ? '' : `<button class="btn" onclick="toggleAdmin(${u.id}, ${u.is_admin})">${u.is_admin ? 'Revoke admin' : 'Make admin'}</button>`}
+          ${currentUser?.is_super_admin ? `<button class="btn" onclick="toggleAiAccess(${u.id}, ${u.ai_access})">${u.ai_access ? 'Disable Ask Goby' : 'Enable Ask Goby'}</button>` : ''}
           <button class="btn" onclick="resetPassword(${u.id})">Reset password</button>
           ${isSelfSuperAdmin ? '' : `<button class="btn danger" onclick="deleteUser(${u.id})">Delete</button>`}
         `}
@@ -737,6 +770,16 @@ function editUserGroups(id) {
 async function toggleAdmin(id, isAdmin) {
   try {
     await api(`/api/admin/users/${id}`, { method: 'PATCH', body: JSON.stringify({ is_admin: !isAdmin }) });
+    showMsg('Updated');
+    await loadUsers();
+  } catch (e) { showMsg(e.message, true); }
+}
+
+// Super admin only — server independently enforces this (403 for anyone
+// else), this button is just not offered otherwise (see renderUsers()).
+async function toggleAiAccess(id, aiAccess) {
+  try {
+    await api(`/api/admin/users/${id}`, { method: 'PATCH', body: JSON.stringify({ ai_access: !aiAccess }) });
     showMsg('Updated');
     await loadUsers();
   } catch (e) { showMsg(e.message, true); }
@@ -1095,7 +1138,34 @@ async function loadAll() {
   document.getElementById('user-menu-name').textContent = displayName;
   document.getElementById('user-menu-fullname').textContent = displayName;
   document.getElementById('user-menu-username').textContent = fullName ? `@${currentUser.username}` : '';
-  await Promise.all([loadGroups(), loadCodes(), loadUsers(), loadUnassigned(), loadPrivateDevices(), loadArchivedDevices(), loadAuditLog(), loadVersion()]);
+  await Promise.all([loadGroups(), loadCodes(), loadUsers(), loadUnassigned(), loadPrivateDevices(), loadArchivedDevices(), loadAuditLog(), loadVersion(), loadAiSettings(), loadActiveUsers()]);
+  // "Active now" is inherently live — unlike every other section here (which
+  // intentionally loads once and expects a page reload for fresh data), a
+  // stale "who's online" list would defeat the point of the feature.
+  setInterval(loadActiveUsers, 30000);
+}
+
+async function loadActiveUsers() {
+  try {
+    renderActiveUsers(await api('/api/admin/active-users'));
+  } catch (e) { /* non-critical — leave the previous render in place on failure */ }
+}
+
+function renderActiveUsers(rows) {
+  document.getElementById('active-users-count').textContent = `${rows.length} active`;
+  const list = document.getElementById('active-users-list');
+  if (!rows.length) { list.innerHTML = '<div id="empty-hint">No one active right now</div>'; return; }
+  list.innerHTML = rows.map(u => `
+    <div class="card">
+      <div class="card-main">
+        <div class="card-title">
+          ${escapeHtml(u.username)}
+          ${u.is_super_admin ? '<span class="chip private">super admin</span>' : (u.is_admin ? '<span class="chip admin">admin</span>' : '')}
+        </div>
+        <div class="card-sub">last seen ${escapeHtml(u.last_seen_at)}</div>
+      </div>
+    </div>
+  `).join('');
 }
 
 async function loadVersion() {
@@ -1103,6 +1173,42 @@ async function loadVersion() {
     const v = await api('/api/admin/version');
     document.getElementById('version-info').textContent = `App v${v.app_version} · Schema v${v.schema_version}`;
   } catch (e) { /* non-critical — leave blank on failure */ }
+}
+
+// ── AI Assistant toggle (super admin only) ──────────────────────────
+let aiSettingsState = null;
+
+async function loadAiSettings() {
+  if (!currentUser.is_super_admin) return;  // section stays display:none for everyone else
+  document.getElementById('ai-settings-section').style.display = 'block';
+  try {
+    renderAiSettings(await api('/api/admin/ai-settings'));
+  } catch (e) { /* non-critical — section just won't populate on failure */ }
+}
+
+function renderAiSettings(s) {
+  aiSettingsState = s;
+  const statusEl = document.getElementById('ai-settings-status');
+  const btn = document.getElementById('ai-settings-toggle-btn');
+  if (!s.configured) {
+    statusEl.textContent = 'No LLM backend is configured (LLM_API_BASE_URL is unset) — nothing to toggle yet.';
+    btn.style.display = 'none';
+    return;
+  }
+  statusEl.textContent = `Ask Goby is currently ${s.enabled ? 'enabled' : 'disabled'} for all users.`;
+  btn.style.display = 'inline-block';
+  btn.textContent = s.enabled ? 'Disable Ask Goby' : 'Enable Ask Goby';
+  btn.className = s.enabled ? 'btn danger' : 'btn-primary';
+}
+
+async function toggleAiEnabled() {
+  try {
+    renderAiSettings(await api('/api/admin/ai-settings', {
+      method: 'PATCH', body: JSON.stringify({ enabled: !aiSettingsState.enabled }),
+    }));
+  } catch (e) {
+    document.getElementById('ai-settings-status').textContent = e.message || 'Failed to update — try again.';
+  }
 }
 
 loadAll();

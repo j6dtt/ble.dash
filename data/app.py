@@ -1,7 +1,9 @@
 import logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
+import csv
 import json
+import math
 import os
 import queue
 import re
@@ -14,9 +16,10 @@ from datetime import timedelta, datetime, timezone
 from functools import wraps
 from flask import (
     Flask, Response, jsonify, render_template, request,
-    session, redirect, url_for, abort,
+    session, redirect, url_for, abort, stream_with_context,
 )
 from werkzeug.security import generate_password_hash, check_password_hash
+import requests
 import comlibv3
 
 TCP_HOST = "0.0.0.0"
@@ -24,7 +27,20 @@ TCP_PORT = int(os.environ.get("TCP_PORT", 9002))
 HTTP_PORT = int(os.environ.get("HTTP_PORT", 8080))
 DB_PATH = os.environ.get("DB_PATH", "tracks.db")
 BACKUP_DIR = os.path.join(os.path.dirname(DB_PATH) or ".", "backup")
+GEODATA_DIR = os.path.join(os.path.dirname(DB_PATH) or ".", "geodata")
 AUDIT_LOG_RETENTION_DAYS = int(os.environ.get("AUDIT_LOG_RETENTION_DAYS", 90))
+# Separate from AUDIT_LOG_RETENTION_DAYS on purpose — ai_messages holds free-text
+# conversation content (positions, movement, label text a user asked about),
+# not terse structured audit entries, so it deserves its own independently
+# tunable retention window rather than being tied to the audit log's.
+AI_HISTORY_RETENTION_DAYS = int(os.environ.get("AI_HISTORY_RETENTION_DAYS", 90))
+# Lowered from the original 12h default — a sliding window (refreshed on
+# every request via Flask's SESSION_REFRESH_EACH_REQUEST default), so this
+# only actually matters after real inactivity, not a fixed cutoff from login.
+SESSION_LIFETIME_HOURS = int(os.environ.get("SESSION_LIFETIME_HOURS", 3))
+# How recently a user must have touched an authenticated route to count as
+# "currently logged on" — see _touch_last_seen()/GET /api/admin/active-users.
+ACTIVE_USER_WINDOW_MINUTES = int(os.environ.get("ACTIVE_USER_WINDOW_MINUTES", 15))
 
 # Basemap: OpenStreetMap raster tiles by default (works anywhere, no internal
 # network required — this is what dev uses). If BASEMAP_WMS_URL is set, the
@@ -34,6 +50,23 @@ AUDIT_LOG_RETENTION_DAYS = int(os.environ.get("AUDIT_LOG_RETENTION_DAYS", 90))
 BASEMAP_WMS_URL = os.environ.get("BASEMAP_WMS_URL", "")
 BASEMAP_WMS_LAYERS = os.environ.get("BASEMAP_WMS_LAYERS", "OSM_BASEMAP")
 BASEMAP_ATTRIBUTION = os.environ.get("BASEMAP_ATTRIBUTION", "NGA OSM")
+
+# Ask AI: OpenAI-compatible chat-completions endpoint (self-hosted vLLM in
+# prod; Ollama, run as its own docker-compose service, in dev — see
+# docker-compose.yml). Unset LLM_API_BASE_URL (default) disables the feature
+# entirely — same graceful-degradation pattern as BASEMAP_WMS_URL.
+LLM_API_BASE_URL = os.environ.get("LLM_API_BASE_URL", "").rstrip("/")
+LLM_MODEL = os.environ.get("LLM_MODEL", "")
+LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
+# 60s default — measured against dev's CPU-only Ollama: ~11.5s to cold-load an
+# 8B model plus ~30s to prefill a ~1300-token prompt (digest + system prompt +
+# history) at ~39 tok/s. This is a per-read gap timeout (time with literally
+# no bytes arriving), not a total-response cap, so it only needs to cover the
+# slowest single gap — almost always the first token. Prod's GPU-backed vLLM
+# should clear this with a lot of room to spare; raise it further here if a
+# larger model/prompt makes cold CPU inference in dev time out again.
+LLM_TIMEOUT_SECONDS = int(os.environ.get("LLM_TIMEOUT_SECONDS", 60))
+LLM_MAX_CONCURRENT = int(os.environ.get("LLM_MAX_CONCURRENT", 4))
 
 # Bump this whenever init_db() adds a table/column. Purely informational — the
 # actual migration logic below is what's safe/idempotent — but it gives a
@@ -45,14 +78,25 @@ BASEMAP_ATTRIBUTION = os.environ.get("BASEMAP_ATTRIBUTION", "NGA OSM")
 # (device_meta.private_owner_id).
 # 6 = Labels feature (device_labels, label_users) replacing the old single
 # device_meta.notes field; notes content one-time-migrated into device_labels.
-SCHEMA_VERSION = 6
+# 7 = Ask AI feature (ai_messages table); no changes to existing tables.
+# 8 = users.last_seen_at, for the "who's currently active" Management section.
+# 9 = users.ai_access, per-user Ask Goby enable/disable (super admin only).
+# 10 = device_plans (Smart Tracking stage 1: declared destination/proximity/ETA).
+# 11 = device_plan_history (one row per plan create/update/delete, survives
+# device_plans itself being overwritten/removed).
+# 12 = device_plans.start_date / device_plan_history.start_date — explicit,
+# operator-declared "this plan begins on X", replacing updated_at as the
+# progress-trend cutoff (see _compute_plan_status()).
+# 13 = device_plan_history.outcome — distinguishes a manual "mark arrived"
+# close-out from a plain cancellation on a 'deleted' row.
+SCHEMA_VERSION = 13
 
 # App release version — bumped independently of SCHEMA_VERSION (a release can
 # ship with no schema change, or vice versa). Tracked the same way: stamped
 # into app_settings every startup, with a change logged to audit_log (not
 # just overwritten silently) so Management's Activity Log shows a real
 # history of what version was running when.
-APP_VERSION = "3.0"
+APP_VERSION = "4.3"
 
 
 def _load_or_create_secret_key() -> str:
@@ -77,17 +121,39 @@ app.config.update(
     SESSION_COOKIE_SECURE=True,      # app is TLS-only already
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
-    PERMANENT_SESSION_LIFETIME=timedelta(hours=12),
+    PERMANENT_SESSION_LIFETIME=timedelta(hours=SESSION_LIFETIME_HOURS),
 )
 
 _sse_clients: list[tuple] = []   # (queue.Queue, is_super_admin: bool, is_admin: bool, group_ids: frozenset[int], private_uuids: frozenset[str])
 _sse_lock = threading.Lock()
+
+# Bounds how many /api/ai/ask streams can be in flight at once. Each one holds
+# a gunicorn thread for its duration, same budget as /stream's SSE threads
+# (see gunicorn_config.py) — a modest default leaves headroom so a burst of
+# chat usage can't starve ordinary dashboard tabs.
+_AI_SEMAPHORE = threading.Semaphore(LLM_MAX_CONCURRENT)
 
 
 # --- Auth helpers ---
 
 def _wants_json() -> bool:
     return request.path.startswith("/api/") or request.path == "/stream"
+
+
+def _touch_last_seen(user_id: int):
+    """Updates users.last_seen_at — called from both auth decorators below, so
+    it fires on virtually every authenticated request on both pages (not just
+    /stream, which only index.html opens and wouldn't reflect Management
+    activity at all). No debounce — at this app's real scale (a handful of
+    users) a write per request is trivial, and debouncing would just be
+    complexity this doesn't need. Never raises into the caller: a failure
+    here must not break the actual request being served."""
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            con.execute("UPDATE users SET last_seen_at = datetime('now') WHERE id = ?", (user_id,))
+            con.commit()
+    except Exception:
+        logging.exception("Failed to update last_seen_at for user_id=%s", user_id)
 
 
 def login_required(view):
@@ -97,6 +163,7 @@ def login_required(view):
             if _wants_json():
                 return jsonify({"error": "authentication required"}), 401
             return redirect(url_for("login", next=request.path))
+        _touch_last_seen(session["user_id"])
         return view(*args, **kwargs)
     return wrapped
 
@@ -112,6 +179,7 @@ def admin_required(view):
             if _wants_json():
                 return jsonify({"error": "admin privileges required"}), 403
             abort(403)
+        _touch_last_seen(session["user_id"])
         return view(*args, **kwargs)
     return wrapped
 
@@ -193,6 +261,118 @@ def _visibility_sql() -> tuple[str, list]:
     return clause, [*group_ids, *private_uuids]
 
 
+# Smart Tracking stage 2 — status computed from plain math/SQL, never the
+# model (see CLAUDE.md's Smart Tracking section). Overdue: the ETA window's
+# end plus this grace period has passed. Moving away: current distance to
+# the destination exceeds the closest this device has ever gotten (since
+# the plan's own declared start_date — NOT updated_at, a system timestamp
+# of whenever the row was last saved that would conflate "edited the ETA"
+# with "the plan restarted"; start_date is the operator's explicit,
+# deliberate answer to that) by more than this many miles — deliberately
+# NOT a "hasn't reported in N minutes" staleness check, since multi-day
+# silence then a burst of updates is normal for these devices (see the
+# Smart Tracking brainstorm notes) — only a real move in the wrong
+# direction counts, not silence itself.
+_OVERDUE_GRACE_HOURS = 24
+_PROGRESS_TREND_THRESHOLD_MILES = 50
+
+
+def _compute_plan_status(uuid: str, plan_row, current_lat=None, current_lon=None) -> dict:
+    """Deterministic plan status for one device — `status` is "overdue",
+    "moving_away", or "on_track" (overdue takes priority if both are true,
+    since it's the more directly actionable signal). `current_lat`/`lon` can
+    be passed in by a caller that already has the device's latest position
+    (e.g. _visible_devices()) to avoid a redundant query; callers without it
+    (e.g. the Ask Goby tool) get it queried here instead."""
+    dest_lat, dest_lon = plan_row["dest_lat"], plan_row["dest_lon"]
+    eta_end = plan_row["eta_end"]
+    is_overdue = False
+    if eta_end:
+        try:
+            cutoff = datetime.strptime(eta_end, "%Y-%m-%d") + timedelta(days=1, hours=_OVERDUE_GRACE_HOURS)
+            is_overdue = datetime.now(timezone.utc).replace(tzinfo=None) > cutoff
+        except ValueError:
+            pass
+
+    if current_lat is None or current_lon is None:
+        with sqlite3.connect(DB_PATH) as con:
+            last = con.execute(
+                "SELECT lat, lon FROM observations WHERE uuid = ? ORDER BY obs_time DESC LIMIT 1", (uuid,)
+            ).fetchone()
+        if last:
+            current_lat, current_lon = last
+
+    current_distance_miles = closest_approach_miles = None
+    if current_lat is not None:
+        current_distance_miles = round(_haversine_meters(current_lat, current_lon, dest_lat, dest_lon) / _METERS_PER_MILE, 1)
+    with sqlite3.connect(DB_PATH) as con:
+        rows = con.execute(
+            "SELECT lat, lon FROM observations WHERE uuid = ? AND obs_time >= ?",
+            (uuid, plan_row["start_date"]),
+        ).fetchall()
+    if rows:
+        closest_approach_miles = round(
+            min(_haversine_meters(r[0], r[1], dest_lat, dest_lon) for r in rows) / _METERS_PER_MILE, 1
+        )
+
+    is_moving_away = (
+        current_distance_miles is not None and closest_approach_miles is not None
+        and current_distance_miles > closest_approach_miles + _PROGRESS_TREND_THRESHOLD_MILES
+    )
+    status = "overdue" if is_overdue else ("moving_away" if is_moving_away else "on_track")
+    return {
+        "status": status, "is_overdue": is_overdue, "is_moving_away": is_moving_away,
+        "current_distance_miles": current_distance_miles, "closest_approach_miles": closest_approach_miles,
+    }
+
+
+def _visible_devices(want_archived: bool = False) -> list[dict]:
+    """Latest position + fix count per device visible to the current session —
+    the same rows /api/devices returns, as plain dicts. Single source of truth
+    reused by the AI assistant's insight layer so it can never surface more
+    than the dashboard itself would for that session."""
+    query = """
+        SELECT o.uuid, o.name, o.lat, o.lon, o.obs_time AS last_seen,
+               o.accuracy, o.confidence, cnt.fix_count, m.archived_at,
+               COALESCE(m.private, 0) AS private,
+               g.id AS group_id, COALESCE(g.name, 'Unassigned') AS group_name, g.color AS group_color
+        FROM observations o
+        INNER JOIN (
+            SELECT uuid, MAX(obs_time) AS max_time FROM observations GROUP BY uuid
+        ) latest ON o.uuid = latest.uuid AND o.obs_time = latest.max_time
+        INNER JOIN (
+            SELECT uuid, COUNT(*) AS fix_count FROM observations GROUP BY uuid
+        ) cnt ON o.uuid = cnt.uuid
+        LEFT JOIN device_meta m ON m.uuid = o.uuid
+        LEFT JOIN group_codes gc ON gc.code = substr(o.name, 2, 1)
+        LEFT JOIN groups g ON g.id = gc.group_id
+        WHERE COALESCE(m.archived, 0) = ?
+    """
+    params = [1 if want_archived else 0]
+    clause, extra_params = _visibility_sql()
+    query += clause
+    params.extend(extra_params)
+    query += " ORDER BY last_seen DESC"
+    with sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        rows = con.execute(query, params).fetchall()
+        devices = [dict(r) for r in rows]
+        plans = {}
+        if devices:
+            uuids = [d["uuid"] for d in devices]
+            placeholders = ",".join("?" * len(uuids))
+            plans = {r["uuid"]: r for r in con.execute(
+                f"SELECT * FROM device_plans WHERE uuid IN ({placeholders})", uuids
+            ).fetchall()}
+    # Only the (typically few, often zero) devices with an active plan pay
+    # for the extra per-device status computation — not every device on
+    # every call.
+    for d in devices:
+        plan = plans.get(d["uuid"])
+        d["plan_status"] = _compute_plan_status(d["uuid"], plan, d["lat"], d["lon"])["status"] if plan else None
+    return devices
+
+
 _HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 
 
@@ -266,6 +446,13 @@ def init_db():
             con.execute("ALTER TABLE users ADD COLUMN last_name TEXT")
         if "is_super_admin" not in existing_user_cols:
             con.execute("ALTER TABLE users ADD COLUMN is_super_admin INTEGER NOT NULL DEFAULT 0")
+        if "last_seen_at" not in existing_user_cols:
+            con.execute("ALTER TABLE users ADD COLUMN last_seen_at TEXT")
+        if "ai_access" not in existing_user_cols:
+            # Per-user Ask Goby enable/disable, super admin only — defaults
+            # to 1 (allowed) so upgrading an existing deployment doesn't
+            # silently cut anyone off who was already using the feature.
+            con.execute("ALTER TABLE users ADD COLUMN ai_access INTEGER NOT NULL DEFAULT 1")
         # The account literally named "admin" is always the super admin,
         # regardless of when/how it was created — re-asserted every startup
         # (not just on fresh installs) so this holds on existing deployments
@@ -319,6 +506,80 @@ def init_db():
                 PRIMARY KEY (label_id, user_id)
             )
         """)
+        # Smart Tracking, stage 1: a device's plan (declared destination +
+        # proximity + ETA window). uuid is the PRIMARY KEY, not a separate id
+        # — "single destination, changeable" means there's at most one row
+        # per device, and a new POST upserts over it rather than creating a
+        # second row. dest_lat/dest_lon/radius_miles is a PROXIMITY circle,
+        # deliberately never an exact point (the destination itself is
+        # sensitive) — this same circle doubles as the arrival-detection
+        # zone in a later stage, so there's no separate "arrival radius" to
+        # keep in sync with it. No status/history columns yet — this stage
+        # is plan-setting + the map circle only; overdue/progress-trend
+        # alerts and manual close-out are a deliberately separate later
+        # stage (staged on purpose, not an oversight).
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS device_plans (
+                uuid         TEXT PRIMARY KEY,
+                dest_lat     REAL NOT NULL,
+                dest_lon     REAL NOT NULL,
+                radius_miles REAL NOT NULL,
+                eta_start    TEXT,
+                eta_end      TEXT,
+                created_by   INTEGER REFERENCES users(id),
+                created_at   TEXT DEFAULT (datetime('now')),
+                updated_at   TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        existing_plan_cols = {row[1] for row in con.execute("PRAGMA table_info(device_plans)")}
+        if "start_date" not in existing_plan_cols:
+            # Explicit, operator-declared "this plan begins on X" —
+            # deliberately NOT the same as updated_at (a system timestamp of
+            # whenever the row was last saved, which the progress-trend
+            # calculation used before this column existed, and which
+            # conflated "edited the ETA" with "the plan restarted").
+            # Backfilled from created_at for rows that predate this column,
+            # which is the closest honest approximation available.
+            con.execute("ALTER TABLE device_plans ADD COLUMN start_date TEXT")
+            con.execute("UPDATE device_plans SET start_date = date(created_at) WHERE start_date IS NULL")
+        # A basic history of every create/update/delete of a plan — unlike
+        # audit_log (which deliberately never logs dest_lat/dest_lon, since
+        # that log has no per-device visibility filter and any admin can
+        # read it), this table's own read route is gated by
+        # _device_visible(uuid), the same check the live plan itself uses —
+        # so it's safe to store the real destination here. One row per
+        # change, not per device, so a device's full plan history survives
+        # being edited or deleted (device_plans itself only ever holds the
+        # CURRENT state, overwritten in place on every edit).
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS device_plan_history (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                uuid         TEXT NOT NULL,
+                action       TEXT NOT NULL,
+                dest_lat     REAL NOT NULL,
+                dest_lon     REAL NOT NULL,
+                radius_miles REAL NOT NULL,
+                eta_start    TEXT,
+                eta_end      TEXT,
+                changed_by   INTEGER REFERENCES users(id),
+                changed_at   TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        con.execute("CREATE INDEX IF NOT EXISTS idx_device_plan_history_uuid ON device_plan_history(uuid)")
+        existing_history_cols = {row[1] for row in con.execute("PRAGMA table_info(device_plan_history)")}
+        if "start_date" not in existing_history_cols:
+            con.execute("ALTER TABLE device_plan_history ADD COLUMN start_date TEXT")
+        if "outcome" not in existing_history_cols:
+            # Distinguishes WHY a plan ended on a 'deleted' row — 'arrived'
+            # (the device reached its destination) vs 'cancelled' (anything
+            # else) vs NULL (a 'created'/'updated' row, which isn't an
+            # ending at all). Kept as a separate column rather than adding a
+            # 4th `action` value, so `action` stays the plain CRUD-style
+            # vocabulary (created/updated/deleted) and `outcome` carries the
+            # domain meaning — manual close-out, per the original Smart
+            # Tracking design decision, now actually distinguishable in the
+            # history it writes to instead of being generically "deleted."
+            con.execute("ALTER TABLE device_plan_history ADD COLUMN outcome TEXT")
         # One-time backfill: the old single free-text device_meta.notes field
         # becomes an initial public label per device that had one. Guarded by
         # an app_settings flag (not "does device_labels have rows", which
@@ -350,6 +611,17 @@ def init_db():
             )
         """)
         con.execute("CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts)")
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS ai_messages (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    INTEGER REFERENCES users(id),
+                username   TEXT,
+                role       TEXT NOT NULL,
+                content    TEXT NOT NULL,
+                created_at TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        con.execute("CREATE INDEX IF NOT EXISTS idx_ai_messages_user ON ai_messages(user_id, created_at)")
         _stamp_version(con, "schema_version", str(SCHEMA_VERSION))
         _stamp_version(con, "app_version", APP_VERSION)
         con.commit()
@@ -481,6 +753,31 @@ def _audit_log_pruner():
         time.sleep(24 * 60 * 60)
 
 
+def _prune_ai_messages():
+    """Deletes ai_messages rows older than AI_HISTORY_RETENTION_DAYS — same
+    reasoning and structure as _prune_audit_log(), just a separate table and
+    env var (see AI_HISTORY_RETENTION_DAYS)."""
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.execute(
+            "DELETE FROM ai_messages WHERE created_at < datetime('now', ?)",
+            (f"-{AI_HISTORY_RETENTION_DAYS} days",),
+        )
+        con.commit()
+        if cur.rowcount:
+            logging.info("Pruned %d ai_messages row(s) older than %d days", cur.rowcount, AI_HISTORY_RETENTION_DAYS)
+
+
+def _ai_history_pruner():
+    """Runs _prune_ai_messages() immediately, then once every 24h — same
+    daemon-thread pattern as _audit_log_pruner()."""
+    while True:
+        try:
+            _prune_ai_messages()
+        except Exception:
+            logging.exception("AI history pruning failed")
+        time.sleep(24 * 60 * 60)
+
+
 def _device_visible(uuid: str) -> bool:
     """True if the current session user is allowed to see/annotate this
     device. Super admin: always. Private devices need an explicit
@@ -507,12 +804,16 @@ def _device_visible(uuid: str) -> bool:
 def _label_accessible(con, label, uuid: str) -> bool:
     """Whether the current session can see AND edit this label — the same
     predicate for both, per the feature's own definition ("users who can see
-    a private label can make changes and make it public"). Any admin: always.
-    Public labels: anyone who can see the underlying device. Private labels:
-    the creator, or an explicit label_users grant — being an admin alone is
-    NOT required to create/edit a public label, matching the old fully-open
-    device-notes behavior this feature replaces."""
-    if session.get("is_admin"):
+    a private label can make changes and make it public"). Super admin: always
+    (same unconditional override as private devices). A regular admin is NOT
+    automatically exempt from a private label's allowlist — only the creator,
+    an explicit label_users grant, or the super admin can see/edit a private
+    label someone else set; being a regular admin alone is not enough (fixed —
+    this previously checked is_admin, which wrongly let any admin read every
+    other admin's private labels). Public labels: anyone who can see the
+    underlying device — a regular admin already gets that via _device_visible()
+    on any non-private device, so no separate admin check is needed here."""
+    if session.get("is_super_admin"):
         return True
     if not label["private"]:
         return _device_visible(uuid)
@@ -678,6 +979,7 @@ def index():
         basemap_wms_url=BASEMAP_WMS_URL,
         basemap_wms_layers=BASEMAP_WMS_LAYERS,
         basemap_attribution=BASEMAP_ATTRIBUTION,
+        ai_enabled=_ai_feature_enabled() and _user_ai_allowed(session["user_id"]),
     )
 
 
@@ -833,6 +1135,7 @@ def create_device_label(uuid):
             for uid in user_ids:
                 con.execute("INSERT OR IGNORE INTO label_users (label_id, user_id) VALUES (?, ?)", (label_id, uid))
         con.commit()
+    log_activity("label.create", target=uuid, detail=f"label_id={label_id} private={private}")
     return jsonify({"id": label_id, "ok": True})
 
 
@@ -865,6 +1168,12 @@ def update_device_label(label_id):
             for uid in data["user_ids"] or []:
                 con.execute("INSERT OR IGNORE INTO label_users (label_id, user_id) VALUES (?, ?)", (label_id, uid))
         con.commit()
+    # Field names only, never the label's own text — same pattern as
+    # user.update/group.update, and specifically important here since a
+    # private label's content shouldn't leak into the admin-visible audit
+    # trail for admins who aren't the creator/granted (see _label_accessible()).
+    changed = [f for f in ("text", "private", "user_ids") if f in data]
+    log_activity("label.update", target=label["uuid"], detail=f"label_id={label_id} fields={','.join(changed)}")
     return jsonify({"ok": True})
 
 
@@ -879,6 +1188,7 @@ def delete_device_label(label_id):
         con.execute("DELETE FROM label_users WHERE label_id = ?", (label_id,))
         con.execute("DELETE FROM device_labels WHERE id = ?", (label_id,))
         con.commit()
+    log_activity("label.delete", target=label["uuid"], detail=f"label_id={label_id} was_private={bool(label['private'])}")
     return jsonify({"ok": True})
 
 
@@ -906,38 +1216,156 @@ def device_group_members(uuid):
     return jsonify([dict(r) for r in rows])
 
 
+@app.route("/api/devices/<uuid>/plan")
+@login_required
+def get_device_plan(uuid):
+    """Smart Tracking stage 1 — a device's declared plan, or null if none.
+    Same visibility rule as labels: anyone who can see the device at all can
+    see its plan (see _device_visible(); plan visibility deliberately
+    matches device visibility, not a separate tier)."""
+    if not _device_visible(uuid):
+        return jsonify({"error": "not found"}), 404
+    with sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        row = con.execute("""
+            SELECT dp.*, u.username AS created_by_username
+            FROM device_plans dp LEFT JOIN users u ON u.id = dp.created_by
+            WHERE dp.uuid = ?
+        """, (uuid,)).fetchone()
+    return jsonify(dict(row) if row else None)
+
+
+@app.route("/api/devices/<uuid>/plan", methods=["POST"])
+@login_required
+def set_device_plan(uuid):
+    """Create or replace this device's plan — "single destination,
+    changeable" means a new POST upserts over any existing one, never a
+    second row (device_plans.uuid is the PRIMARY KEY). Anyone who can see
+    the device can set/edit its plan, same as a public label — there's no
+    separate ownership/exclusivity concept here, unlike private devices."""
+    if not _device_visible(uuid):
+        return jsonify({"error": "not found"}), 404
+    data = request.get_json(force=True, silent=True) or {}
+    try:
+        dest_lat = float(data["dest_lat"])
+        dest_lon = float(data["dest_lon"])
+        radius_miles = float(data["radius_miles"])
+    except (KeyError, TypeError, ValueError):
+        return jsonify({"error": "dest_lat, dest_lon, and radius_miles are required numbers"}), 400
+    if radius_miles <= 0:
+        return jsonify({"error": "radius_miles must be positive"}), 400
+    eta_start = (data.get("eta_start") or "").strip() or None
+    eta_end = (data.get("eta_end") or "").strip() or None
+    # All fields required — a plan with a missing ETA is half-declared and
+    # not meaningfully trackable. Enforced here too, not just client-side in
+    # index.html, same as every other mutating route in this app.
+    if not eta_start or not eta_end:
+        return jsonify({"error": "eta_start and eta_end are required"}), 400
+    # start_date: explicit, operator-declared "this plan begins on X" —
+    # unlike eta_start/eta_end (no sensible default, must be stated), a
+    # missing start_date defaults to today rather than erroring, since
+    # that's correct for the overwhelmingly common case (declaring a plan
+    # the moment it actually begins). Still always a real, stored
+    # value — never left to fall back to updated_at implicitly.
+    start_date = (data.get("start_date") or "").strip() or None
+    if start_date:
+        try:
+            datetime.strptime(start_date, "%Y-%m-%d")
+        except ValueError:
+            return jsonify({"error": "start_date must be in YYYY-MM-DD format"}), 400
+    else:
+        start_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    with sqlite3.connect(DB_PATH) as con:
+        existed = con.execute("SELECT 1 FROM device_plans WHERE uuid = ?", (uuid,)).fetchone() is not None
+        con.execute("""
+            INSERT INTO device_plans
+                (uuid, dest_lat, dest_lon, radius_miles, eta_start, eta_end, start_date, created_by, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(uuid) DO UPDATE SET
+                dest_lat = excluded.dest_lat, dest_lon = excluded.dest_lon,
+                radius_miles = excluded.radius_miles, eta_start = excluded.eta_start,
+                eta_end = excluded.eta_end, start_date = excluded.start_date,
+                created_by = excluded.created_by, updated_at = datetime('now')
+        """, (uuid, dest_lat, dest_lon, radius_miles, eta_start, eta_end, start_date, session["user_id"]))
+        # Unlike audit_log (see below), this table's read route is gated by
+        # _device_visible() same as the live plan, so the real destination
+        # is safe to store here — this is the only place "what was the
+        # destination during a device's earlier plan" can ever be answered,
+        # since device_plans itself only holds the current state.
+        con.execute("""
+            INSERT INTO device_plan_history
+                (uuid, action, dest_lat, dest_lon, radius_miles, eta_start, eta_end, start_date, changed_by)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (uuid, "updated" if existed else "created", dest_lat, dest_lon, radius_miles,
+              eta_start, eta_end, start_date, session["user_id"]))
+        con.commit()
+    # Never log dest_lat/dest_lon to audit_log — the destination is exactly
+    # as sensitive as a private label's text, but the audit log has no
+    # per-device visibility filter (any admin reads it globally), so leaking
+    # the location there would bypass _device_visible()'s own protection for
+    # a private device. radius_miles/eta/start_date reveal nothing about WHERE.
+    log_activity("plan.update" if existed else "plan.create", target=uuid,
+                  detail=f"radius_miles={radius_miles} eta={eta_start or '?'}..{eta_end or '?'} start={start_date}")
+    return jsonify({"ok": True})
+
+
+@app.route("/api/devices/<uuid>/plan", methods=["DELETE"])
+@login_required
+def delete_device_plan(uuid):
+    """Manual close-out, per the original Smart Tracking design decision —
+    there is no automatic "arrived" detection (no geofence-triggered
+    close-out), only this. 'Mark arrived' and 'Cancel plan' in index.html
+    both call this same route — the only difference is the optional
+    `outcome` body field, which only affects what gets written to
+    device_plan_history, never the live device_plans row itself (deleted
+    either way)."""
+    if not _device_visible(uuid):
+        return jsonify({"error": "not found"}), 404
+    data = request.get_json(force=True, silent=True) or {}
+    outcome = data.get("outcome")
+    if outcome not in ("arrived", "cancelled", None):
+        return jsonify({"error": "outcome must be 'arrived' or 'cancelled' if given"}), 400
+    with sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        existing = con.execute("SELECT * FROM device_plans WHERE uuid = ?", (uuid,)).fetchone()
+        cur = con.execute("DELETE FROM device_plans WHERE uuid = ?", (uuid,))
+        if existing:
+            con.execute("""
+                INSERT INTO device_plan_history
+                    (uuid, action, dest_lat, dest_lon, radius_miles, eta_start, eta_end, start_date, outcome, changed_by)
+                VALUES (?, 'deleted', ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (uuid, existing["dest_lat"], existing["dest_lon"], existing["radius_miles"],
+                  existing["eta_start"], existing["eta_end"], existing["start_date"], outcome, session["user_id"]))
+        con.commit()
+    if cur.rowcount:
+        log_activity("plan.delete", target=uuid, detail=f"outcome={outcome}" if outcome else None)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/devices/<uuid>/plan/history")
+@login_required
+def get_device_plan_history(uuid):
+    """Same visibility rule as the live plan — anyone who can see the device
+    can see its full plan history, no new permission tier. Safe to return
+    raw dest_lat/dest_lon here (unlike anything the model sees) since this
+    route itself is the access control, same as GET .../plan already is."""
+    if not _device_visible(uuid):
+        return jsonify({"error": "not found"}), 404
+    with sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        rows = con.execute("""
+            SELECT h.*, u.username AS changed_by_username
+            FROM device_plan_history h LEFT JOIN users u ON u.id = h.changed_by
+            WHERE h.uuid = ? ORDER BY h.changed_at DESC
+        """, (uuid,)).fetchall()
+    return jsonify([dict(r) for r in rows])
+
+
 @app.route("/api/devices")
 @login_required
 def api_devices():
     want_archived = request.args.get("archived") == "1"
-
-    query = """
-        SELECT o.uuid, o.name, o.lat, o.lon, o.obs_time AS last_seen,
-               o.accuracy, o.confidence, cnt.fix_count, m.archived_at,
-               COALESCE(m.private, 0) AS private,
-               g.id AS group_id, COALESCE(g.name, 'Unassigned') AS group_name, g.color AS group_color
-        FROM observations o
-        INNER JOIN (
-            SELECT uuid, MAX(obs_time) AS max_time FROM observations GROUP BY uuid
-        ) latest ON o.uuid = latest.uuid AND o.obs_time = latest.max_time
-        INNER JOIN (
-            SELECT uuid, COUNT(*) AS fix_count FROM observations GROUP BY uuid
-        ) cnt ON o.uuid = cnt.uuid
-        LEFT JOIN device_meta m ON m.uuid = o.uuid
-        LEFT JOIN group_codes gc ON gc.code = substr(o.name, 2, 1)
-        LEFT JOIN groups g ON g.id = gc.group_id
-        WHERE COALESCE(m.archived, 0) = ?
-    """
-    params = [1 if want_archived else 0]
-    clause, extra_params = _visibility_sql()
-    query += clause
-    params.extend(extra_params)
-    query += " ORDER BY last_seen DESC"
-
-    with sqlite3.connect(DB_PATH) as con:
-        con.row_factory = sqlite3.Row
-        rows = con.execute(query, params).fetchall()
-    return jsonify([dict(r) for r in rows])
+    return jsonify(_visible_devices(want_archived))
 
 
 @app.route("/api/devices/<uuid>/archive", methods=["POST"])
@@ -1037,6 +1465,1176 @@ def stream():
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
+# --- AI assistant ---
+#
+# Design: tool-calling, not a pre-built context digest. The model decides what
+# to look up and with what parameters (it actually understands language,
+# unlike a fixed regex list) by calling one of _AI_TOOLS; every tool routes
+# through _visible_devices()/_device_visible()/_label_accessible() (the same
+# RBAC primitives /api/devices and labels use) and independently re-checks
+# visibility itself — the model is never trusted to have only asked about
+# things it's already allowed to see, since a tool-call argument is untrusted
+# model output, no different from user input. No tool ever returns raw
+# coordinates (see _tool_compute_distance's stripping and
+# _try_exact_location_shortcut's comment) — exact locations are answered
+# directly from the database, with no LLM involvement, so real coordinates
+# can never be sent to an external API regardless of which one is configured.
+
+def _llm_configured() -> bool:
+    return bool(LLM_API_BASE_URL)
+
+
+def _ai_feature_enabled() -> bool:
+    """Whether Ask Goby is actually usable right now: an LLM endpoint must be
+    configured (LLM_API_BASE_URL, an env/deploy-level capability) AND the
+    runtime toggle must be on (app_settings.ai_enabled, settable only by the
+    super admin via PATCH /api/admin/ai-settings — see admin_ai_settings()).
+    Defaults to enabled when the setting row doesn't exist yet, so upgrading
+    an existing deployment where the feature is already live doesn't silently
+    turn it off underneath whoever's already using it."""
+    if not _llm_configured():
+        return False
+    with sqlite3.connect(DB_PATH) as con:
+        row = con.execute("SELECT value FROM app_settings WHERE key = 'ai_enabled'").fetchone()
+    return row is None or row[0] == "1"
+
+
+def _user_ai_allowed(user_id: int) -> bool:
+    """Per-user Ask Goby access (users.ai_access), independent of the global
+    deploy/runtime gates above — settable only by the super admin (see
+    admin_update_user()'s ai_access handling). Checked both where the panel
+    is rendered (index()) and, as the real enforcement boundary, inside
+    /api/ai/ask itself — the same two-layer pattern as _ai_feature_enabled()
+    gating both the template var and the route."""
+    with sqlite3.connect(DB_PATH) as con:
+        row = con.execute("SELECT ai_access FROM users WHERE id = ?", (user_id,)).fetchone()
+    return bool(row and row[0])
+
+
+def _llm_chat_once(messages: list[dict], tools: list[dict] | None = None) -> dict:
+    """One non-streaming chat-completions call. Returns the full `choice`
+    object (has both "message" — content and/or tool_calls — and
+    "finish_reason" as siblings). Non-streaming deliberately: assembling
+    tool-call argument fragments out of incrementally-streamed chunks is real
+    added complexity this app has no need for, since only the FINAL round
+    (plain content, no more tool calls) needs to reach the browser live — see
+    _llm_chat_with_tools(), which chunks that already-complete text itself to
+    preserve the streaming UI with none of that complexity. Raises on any
+    failure (timeout, non-200, malformed body); the caller turns that into a
+    clean error event rather than a crash."""
+    payload = {
+        "model": LLM_MODEL, "messages": messages,
+        "temperature": 0.1, "max_tokens": 1500, "stream": False,
+    }
+    if tools:
+        payload["tools"] = tools
+    resp = requests.post(
+        f"{LLM_API_BASE_URL}/chat/completions", json=payload,
+        headers={"Authorization": f"Bearer {LLM_API_KEY}"} if LLM_API_KEY else {},
+        timeout=(10, LLM_TIMEOUT_SECONDS),
+    )
+    resp.raise_for_status()
+    return resp.json()["choices"][0]
+
+
+def _llm_chat_with_tools(messages: list[dict], max_rounds: int = 5):
+    """The tool-calling dispatch loop — replaces the old single-shot design
+    where _build_ai_context()/_extract_date_range()/_mentioned_device() tried
+    to guess what the question needed *before* the model ever saw it. Now the
+    model itself (which actually understands language, unlike a fixed regex
+    list) decides what to look up and with what parameters, by calling one of
+    _AI_TOOLS; each tool independently re-checks RBAC before touching data
+    (see each _tool_*() function) — the model is never trusted to have only
+    asked about things it's already allowed to see.
+
+    Each round is a plain non-streaming call (_llm_chat_once): if the model
+    asks for tools, they're run locally and the results fed back in, looping
+    (bounded by max_rounds, so a model that never converges can't loop
+    forever). Once a round returns plain content with no more tool calls,
+    that's the final answer — chunked into small pieces and yielded as text
+    deltas so the browser's existing streaming UI needs no changes, even
+    though the full text was already generated in one non-streaming call."""
+    for _ in range(max_rounds):
+        choice = _llm_chat_once(messages, tools=_AI_TOOLS)
+        message = choice.get("message") or {}
+        tool_calls = message.get("tool_calls")
+        if not tool_calls:
+            content = message.get("content") or ""
+            words = content.split(" ")
+            for i in range(0, len(words), 3):
+                piece = " ".join(words[i:i + 3])
+                yield piece + (" " if i + 3 < len(words) else "")
+            if choice.get("finish_reason") == "length":
+                # Confirmed to happen silently otherwise — a response cut off
+                # mid-sentence with a clean HTTP 200, nothing distinguishing
+                # it from a complete answer.
+                yield "\n\n*(That answer was cut short by a length limit — ask a narrower question, or ask Goby to continue.)*"
+            return
+        messages.append(message)
+        for call in tool_calls:
+            fn_name = call["function"]["name"]
+            try:
+                fn_args = json.loads(call["function"].get("arguments") or "{}")
+            except ValueError:
+                fn_args = {}
+            handler = _AI_TOOL_DISPATCH.get(fn_name)
+            result = handler(fn_args) if handler else {"error": f"unknown tool '{fn_name}'"}
+            log_activity("ai.tool_call", target=fn_name, detail=f"args={json.dumps(fn_args, default=str)}")
+            messages.append({
+                "role": "tool", "tool_call_id": call["id"],
+                "content": json.dumps(result, default=str),
+            })
+    yield "I wasn't able to finish gathering that information — try a narrower question."
+
+
+_METERS_PER_MILE = 1609.344
+
+
+def _haversine_meters(lat1, lon1, lat2, lon2) -> float:
+    r = 6371000.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlambda / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+def _load_geodata():
+    """Loads the vendored GeoNames city/country reference data once at import
+    time (same philosophy as the locally-vendored Leaflet assets — no network
+    call, works identically in dev and air-gapped prod). Returns (cities,
+    countries) where cities is a list of (lat, lon, name, country_code,
+    admin1_name) tuples and countries maps code -> full name; both empty if
+    the files aren't present, so a deployment without them just never gets
+    place names rather than crashing (GEODATA_DIR's files are a few MB, not
+    something every deploy is guaranteed to have copied over yet). admin1
+    (state/province/governorate — whatever a country's top subdivision is
+    called) is resolved deterministically from GeoNames data at vendoring
+    time, same as the city/country names themselves — never left for the
+    model to guess, which is exactly what went wrong before this column
+    existed (see the Ask Goby section in CLAUDE.md)."""
+    cities, countries = [], {}
+    countries_path = os.path.join(GEODATA_DIR, "countries.csv")
+    cities_path = os.path.join(GEODATA_DIR, "cities.csv")
+    try:
+        with open(countries_path, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                countries[row["code"]] = row["name"]
+        with open(cities_path, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                cities.append((
+                    float(row["lat"]), float(row["lon"]), row["name"],
+                    row["country"], row.get("admin1") or "",
+                    int(row.get("population") or 0),
+                ))
+        logging.info("Loaded geodata: %d cities, %d countries", len(cities), len(countries))
+    except (FileNotFoundError, ValueError, KeyError):
+        logging.warning("Geodata not found/invalid at %s — Ask AI will fall back to raw coordinates", GEODATA_DIR)
+    return cities, countries
+
+
+_GEO_CITIES, _GEO_COUNTRIES = _load_geodata()
+
+# A "major" city is one big enough to be a recognizable reference point even
+# if it's not the literal nearest place — e.g. Tampa (pop. ~415k) vs. the
+# actually-nearer Gibsonton (pop. ~14k). ~9% of the vendored dataset clears
+# this bar. Only mentioned as secondary context within this radius — beyond
+# it, "N hundred miles from the nearest big city" isn't meaningfully useful,
+# just noise.
+_MAJOR_CITY_POPULATION = 100_000
+_MAJOR_CITY_MAX_RADIUS_MILES = 75
+
+
+def _place_label(name, admin1, country):
+    return f"{name}, {admin1}, {country}" if admin1 else f"{name}, {country}"
+
+
+def _nearest_place(lat, lon):
+    """Nearest known city to (lat, lon) from the vendored dataset, or None if
+    no geodata is loaded. A linear scan over ~70k rows is a few milliseconds
+    in Python — fine for an occasional per-question lookup, not worth a
+    spatial index for this access pattern. `admin1` is "" for places with no
+    such subdivision (city-states like Singapore) or if an older cities.csv
+    without the column is ever loaded — always a real field, never absent,
+    so callers don't need a .get() with a default.
+
+    Also finds the nearest *major* city in the same country (see
+    _MAJOR_CITY_POPULATION) and folds it into `label` as secondary context
+    when it's a genuinely different, reasonably-nearby place — confirmed
+    live that the literal nearest city can be a small, unrecognizable town
+    (Gibsonton) while a much more useful reference point (Tampa) is only
+    slightly farther; reporting only the literal nearest was technically
+    correct but not what a person actually wants to hear. Deliberately
+    same-country only, a second pass once the primary country is known —
+    the unrestricted version once suggested a Canadian device was "3.4 miles
+    from Buffalo, United States" (true, but crossing a border for a
+    reference point isn't something to do implicitly in an app where which
+    country a device is in can itself be operationally significant)."""
+    if not _GEO_CITIES:
+        return None
+    best, best_dist = None, None
+    for city_lat, city_lon, name, cc, admin1, population in _GEO_CITIES:
+        d = _haversine_meters(lat, lon, city_lat, city_lon)
+        if best_dist is None or d < best_dist:
+            best, best_dist = (name, cc, admin1), d
+    name, cc, admin1 = best
+    country = _GEO_COUNTRIES.get(cc, cc)
+    best_major, best_major_dist = None, None
+    for city_lat, city_lon, major_name, major_cc, major_admin1, population in _GEO_CITIES:
+        if major_cc != cc or population < _MAJOR_CITY_POPULATION:
+            continue
+        d = _haversine_meters(lat, lon, city_lat, city_lon)
+        if best_major_dist is None or d < best_major_dist:
+            best_major, best_major_dist = (major_name, major_cc, major_admin1), d
+    distance_miles = round(best_dist / _METERS_PER_MILE, 1)
+    # A complete, ready-to-insert phrase — including the "about N miles
+    # from" lead-in, not just the place name — not left for the model to
+    # assemble from the separate fields below or to decide where the
+    # distance goes relative to the secondary city. Confirmed live that
+    # leaving any assembly to the model isn't reliable: it dropped the state
+    # once, then reordered the primary distance and the secondary city
+    # another time. A single field it's told to insert as one unit leaves
+    # it nothing left to decide.
+    label = f"about {distance_miles} miles from {_place_label(name, admin1, country)}"
+    if best_major and best_major[0] != name:
+        major_distance_miles = round(best_major_dist / _METERS_PER_MILE, 1)
+        if major_distance_miles <= _MAJOR_CITY_MAX_RADIUS_MILES:
+            major_name, major_cc, major_admin1 = best_major
+            major_country = _GEO_COUNTRIES.get(major_cc, major_cc)
+            label += f" (~{major_distance_miles} miles from {_place_label(major_name, major_admin1, major_country)})"
+    return {
+        "label": label,
+        "name": name,
+        "admin1": admin1,
+        "country": country,
+        "distance_miles": distance_miles,
+    }
+
+
+def _position_snapshot(pt) -> dict:
+    """A single observation row as a position fact for the AI — raw lat/lon
+    (for when exact coordinates are asked for) plus the resolved nearest place
+    (for normal conversation), same dual representation as _fleet_digest()'s
+    per-device entries."""
+    snap = {"lat": pt["lat"], "lon": pt["lon"], "obs_time": pt["obs_time"]}
+    near = _nearest_place(pt["lat"], pt["lon"])
+    if near:
+        snap["near"] = near
+    return snap
+
+
+def _parse_obs_time(s):
+    if not s:
+        return None
+    try:
+        return datetime.strptime(s.strip().rstrip(";").strip(), "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+
+
+def _device_cadence(uuid: str) -> dict:
+    """Cadence baseline + staleness relative to the device's OWN typical
+    reporting rate — not a fixed global threshold, which would mean nothing
+    across devices with different normal cadences. Cheap (one bounded query),
+    so it's computed for every visible device in _fleet_digest(), not just a
+    named one — otherwise the model is left guessing what counts as 'stale'
+    for a device it has no baseline for."""
+    with sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            "SELECT obs_time FROM observations WHERE uuid = ? ORDER BY obs_time DESC LIMIT 50",
+            (uuid,),
+        ).fetchall()
+    cadence: dict = {}
+    times = [t for t in (_parse_obs_time(r["obs_time"]) for r in rows) if t]
+    if len(times) >= 2:
+        gaps = sorted((times[i] - times[i + 1]).total_seconds() for i in range(len(times) - 1))
+        median_gap = gaps[len(gaps) // 2]
+        since_last = (datetime.now(timezone.utc).replace(tzinfo=None) - times[0]).total_seconds()
+        cadence["typical_fix_interval_minutes"] = round(median_gap / 60, 1)
+        cadence["minutes_since_last_fix"] = round(since_last / 60, 1)
+        if median_gap > 0 and since_last / median_gap > 3:
+            cadence["staleness"] = (
+                f"quiet {round(since_last / median_gap, 1)}x longer than its usual "
+                f"~{round(median_gap / 60, 1)} min reporting cadence"
+            )
+        else:
+            cadence["staleness"] = "reporting normally"
+    else:
+        cadence["staleness"] = "not enough history to establish a baseline"
+    return cadence
+
+
+def _device_recent_distance(uuid: str, days: int | None = 30):
+    """Total distance traveled in the last `days` days — cheap (one bounded
+    query, same 30-day default as the dashboard's own track window) and
+    computed for EVERY visible device in _fleet_digest(), not just one a
+    question happens to name. `days=None` means all-time, no filter at all —
+    `list_devices`'s `days` argument lets the model pass the actual period
+    asked about ("last 99 days", "all-time") instead of being stuck with a
+    fixed 30, closing a real gap: a fleet-wide question naming a different
+    period than 30 days previously had no way to get anything but the
+    hardcoded default.
+
+    This closes a separate, earlier confirmed hallucination too: a fleet-wide
+    question ("give me a summary of distance traveled of all devices") with
+    no single device named left _mentioned_device() matching nothing and no
+    distance data computed for ANYTHING — the model fabricated four specific,
+    plausible-looking numbers anyway (two devices sharing an identical
+    "2058.02 miles", and "0 miles" for a device that has actually traveled
+    ~2817 miles), rather than saying it didn't have the data. The fix is
+    structural, not a stronger prompt instruction: give every device a real
+    number to draw from for exactly this question shape, since an explicit
+    "never invent statistics" instruction alone isn't reliable enough against
+    a small model when the alternative is an empty field."""
+    with sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        if days is not None:
+            pts = con.execute(
+                "SELECT lat, lon FROM observations WHERE uuid = ? AND obs_time >= datetime('now', ?) ORDER BY obs_time",
+                (uuid, f"-{days} days"),
+            ).fetchall()
+        else:
+            pts = con.execute(
+                "SELECT lat, lon FROM observations WHERE uuid = ? ORDER BY obs_time", (uuid,)
+            ).fetchall()
+    if len(pts) < 2:
+        return None
+    total = sum(_haversine_meters(pts[i - 1]["lat"], pts[i - 1]["lon"], pts[i]["lat"], pts[i]["lon"])
+                for i in range(1, len(pts)))
+    return round(total / _METERS_PER_MILE, 2)
+
+
+def _device_signal_quality(uuid: str) -> dict:
+    """Average confidence/accuracy across all of a device's fixes — added
+    after a confirmed real gap: asked "which device has the highest average
+    confidence level?", the model correctly said it had no such metric,
+    because no tool exposed it, even though `confidence`/`accuracy` are real
+    columns on every observation row (and already shown per-fix on the
+    regular dashboard's device cards — `_fleet_digest()` just never surfaced
+    the aggregate). One cheap AVG() query, same always-included philosophy as
+    distance_last_30_days_miles, so a fleet-wide comparison question has a
+    real number for every device without needing a new dedicated tool."""
+    with sqlite3.connect(DB_PATH) as con:
+        row = con.execute(
+            "SELECT AVG(confidence), AVG(accuracy) FROM observations WHERE uuid = ?", (uuid,)
+        ).fetchone()
+    return {
+        "avg_confidence": round(row[0], 2) if row[0] is not None else None,
+        "avg_accuracy": round(row[1], 2) if row[1] is not None else None,
+    }
+
+
+_ISO_DATE_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
+# Signals that a lone date should mean "through now", not just that one day:
+# either a leading since/from/after, or a trailing "to <something open-ended>"
+# — confirmed necessary live: "between 2026-09-15 to last updated" has neither
+# "since" nor "from" immediately by the date, so the original since/from/after
+# check alone left it defaulting to a single day (2026-09-15 only), when the
+# question clearly meant "from that date through whatever's most recent."
+_OPEN_ENDED_DATE_RE = re.compile(
+    r"\b(since|from|after)\b|\bto\s+(now|today|present|the\s+latest|last\s+updat\w*|current\w*)\b"
+)
+
+
+def _extract_date_range(question: str):
+    """Best-effort date-range extraction so 'how far did it travel between X
+    and Y' / 'yesterday' / 'last 3 days' scope the movement calculation to
+    that window instead of always using full history. Two explicit YYYY-MM-DD
+    dates define an exact range; a single one means "since that date, through
+    now" (not just that one calendar day) — this is how it's actually phrased
+    in practice ("since/from/after X", "X to today") and defaulting to a
+    single day caused a real, confirmed failure: a device's data started
+    2026-09-08, "how far did it travel since 2026-09-01?" was treated as just
+    2026-09-01 itself (zero points, before the device existed), and the model
+    truthfully but wrongly reported no data — even though "since 2026-09-01
+    through now" covers the device's entire 1,610-point history. A handful of
+    common relative phrases cover the rest — same lightweight heuristic
+    philosophy as _mentioned_device(), not a full date-parsing library.
+    Returns (query_start, query_end, label) or None if the question doesn't
+    name a range (caller falls back to all history). `label` is a ready-to-use,
+    human-phrased description of the range — generated here rather than
+    reconstructed from query_start/end later, because query_end is an
+    exclusive boundary (end-of-day midnight) for a day-granularity range,
+    which reads as confusingly off-by-one if shown to the model/user directly
+    (observed: a small model given "2026-09-28 00:00 to 2026-09-30 00:00" for
+    a "between the 28th and 29th" question concluded the window didn't match
+    and refused to answer at all)."""
+    q = question.lower()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    iso_dates = _ISO_DATE_RE.findall(question)
+    if len(iso_dates) >= 2:
+        d1, d2 = sorted(iso_dates[:2])
+        start, end = datetime.strptime(d1, "%Y-%m-%d"), datetime.strptime(d2, "%Y-%m-%d")
+        return start, end + timedelta(days=1), f"{d1} to {d2} (inclusive)"
+    if len(iso_dates) == 1:
+        start = datetime.strptime(iso_dates[0], "%Y-%m-%d")
+        # "since/from/after X" is open-ended to now; a bare "on X" / "where was
+        # it on X" means just that single day — these are genuinely different
+        # questions (distance traveled vs. a point-in-time position) and both
+        # use a single bare date, so the surrounding wording is the only signal
+        # available. Defaulting a bare date to "since...now" (as an earlier fix
+        # did, to handle the "since" case) broke the other one: "where was test
+        # located on 2026-09-10?" resolved to a 3-week window instead of that
+        # one day, and since movement insight only ever returns distance
+        # aggregates anyway (see first_position/last_position below for the
+        # actual fix to that), the model correctly reported it had no exact
+        # position for that date — confirmed against a real failed query.
+        if _OPEN_ENDED_DATE_RE.search(q):
+            return start, now, f"{iso_dates[0]} through now"
+        return start, start + timedelta(days=1), f"on {iso_dates[0]}"
+    m = re.search(r"\b(?:last|past)\s+(\d+)\s+day", q)
+    if m:
+        days = int(m.group(1))
+        return now - timedelta(days=days), now, f"the last {days} days (through now)"
+    today_midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if "yesterday" in q:
+        return today_midnight - timedelta(days=1), today_midnight, "yesterday"
+    if "today" in q:
+        return today_midnight, now, "today (through now)"
+    if "last week" in q or "this week" in q:
+        return now - timedelta(days=7), now, "the last 7 days (through now)"
+    if "last month" in q or "this month" in q:
+        return now - timedelta(days=30), now, "the last 30 days (through now)"
+    return None
+
+
+def _device_insight(uuid: str, deep: bool = False, date_range=None) -> dict:
+    """Computed facts about one visible device — the cadence baseline (see
+    _device_cadence()) plus, when deep=True, a movement/dwell summary over
+    `date_range` (start, end) if given, else all available history. Caller
+    must have already confirmed the device is visible to this session."""
+    insight = _device_cadence(uuid)
+    with sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        labels = con.execute(
+            "SELECT * FROM device_labels WHERE uuid = ? ORDER BY created_at", (uuid,)
+        ).fetchall()
+        insight["labels"] = [r["text"] for r in labels if _label_accessible(con, r, uuid)][:10]
+        pts = None
+        if deep:
+            if date_range:
+                start, end, label = date_range
+                pts = con.execute(
+                    "SELECT lat, lon, obs_time FROM observations WHERE uuid = ? AND obs_time BETWEEN ? AND ? ORDER BY obs_time",
+                    (uuid, start.strftime("%Y-%m-%d %H:%M:%S"), end.strftime("%Y-%m-%d %H:%M:%S")),
+                ).fetchall()
+                insight["movement_window"] = label
+            else:
+                pts = con.execute(
+                    "SELECT lat, lon, obs_time FROM observations WHERE uuid = ? ORDER BY obs_time",
+                    (uuid,),
+                ).fetchall()
+                insight["movement_window"] = "all available history"
+
+    if deep:
+        if pts:
+            # Actual position data was missing entirely before this — the
+            # movement block below only ever returns aggregate distance
+            # stats, never a real lat/lon, so a question like "where was it
+            # on 2026-09-10?" had nothing to answer from even when the date
+            # window resolved correctly and 105 real fixes existed for that
+            # day (confirmed from a real failed query). first/last position
+            # within whatever window was resolved covers both "where was it
+            # on this single day" (first == near last for a narrow window)
+            # and "where did it start/end up over this range".
+            insight["first_position"] = _position_snapshot(pts[0])
+            insight["last_position"] = _position_snapshot(pts[-1])
+        if pts and len(pts) >= 2:
+            total_distance = 0.0
+            stops = 0
+            longest_dwell_minutes = 0.0
+            cluster_anchor, cluster_start = pts[0], _parse_obs_time(pts[0]["obs_time"])
+            for i in range(1, len(pts)):
+                total_distance += _haversine_meters(pts[i - 1]["lat"], pts[i - 1]["lon"], pts[i]["lat"], pts[i]["lon"])
+                moved = _haversine_meters(cluster_anchor["lat"], cluster_anchor["lon"], pts[i]["lat"], pts[i]["lon"])
+                if moved > 50:
+                    t_prev = _parse_obs_time(pts[i - 1]["obs_time"])
+                    if cluster_start and t_prev:
+                        dwell = (t_prev - cluster_start).total_seconds() / 60
+                        if dwell > 5:
+                            stops += 1
+                            longest_dwell_minutes = max(longest_dwell_minutes, dwell)
+                    cluster_anchor, cluster_start = pts[i], _parse_obs_time(pts[i]["obs_time"])
+            displacement = _haversine_meters(pts[0]["lat"], pts[0]["lon"], pts[-1]["lat"], pts[-1]["lon"])
+            insight["movement"] = {
+                "total_distance_miles": round(total_distance / _METERS_PER_MILE, 2),
+                "straight_line_miles": round(displacement / _METERS_PER_MILE, 2),
+                "stop_count": stops,
+                "longest_dwell_minutes": round(longest_dwell_minutes, 1),
+            }
+        else:
+            # Explicit "don't know" rather than silently omitting the key —
+            # otherwise the model has no signal and might guess at a distance.
+            insight["movement"] = "not enough recorded positions in that window to compute distance"
+    return insight
+
+
+def _fleet_digest(days: int | None = 30) -> dict:
+    """Roll-up across every device visible to the current session — cheap
+    (cadence and recent-distance are each one bounded query per device, no
+    full-history movement/dwell math). Each device's own cadence baseline is
+    included (not just a raw last-seen timestamp) so 'which devices haven't
+    reported recently' has a real per-device basis for 'recently' instead of
+    the model guessing at an arbitrary global threshold. `near` (nearest
+    known city, via the vendored offline geodata — see _nearest_place()) is
+    the ONLY location info here — raw lat/lon is deliberately never included
+    anywhere the model can see it; exact coordinates are answered by
+    _try_exact_location_shortcut() straight from the database, without ever
+    involving the model, specifically so real coordinates can never be sent
+    to an external LLM API regardless of which one is configured.
+
+    `days` (default 30, `None` for all-time) is passed straight through from
+    `_tool_list_devices`'s own `days` argument — a fleet-wide distance window
+    used to be a hardcoded 30 with no way to ask for anything else; now the
+    model can request "the last 99 days" or all-time, same as it already
+    could for a single device via compute_distance. Field names are generic
+    (`distance_miles`, not `distance_last_30_days_miles`) with a separate
+    `distance_window` label stating the actual window used, so a renamed/
+    reused field can never silently drift out of sync with what window it
+    actually covers — same self-documenting-field philosophy as everywhere
+    else distances appear, just via a sibling field instead of baking the
+    number into the name (which would need the field renamed every time the
+    window changes, i.e. on every call)."""
+    devices = _visible_devices()
+    by_group: dict[str, int] = {}
+    summary = []
+    for d in devices:
+        by_group[d["group_name"]] = by_group.get(d["group_name"], 0) + 1
+        entry = {
+            "name": d["name"], "uuid": d["uuid"], "group": d["group_name"],
+            "fix_count": d["fix_count"], "last_seen": d["last_seen"],
+            "distance_miles": _device_recent_distance(d["uuid"], days=days),
+            **_device_cadence(d["uuid"]),
+            **_device_signal_quality(d["uuid"]),
+            # Already computed by _visible_devices() itself — zero extra
+            # cost here. null means no Smart Tracking plan exists for this
+            # device; call get_plan_status for the full destination/ETA
+            # detail behind a non-null value.
+            "plan_status": d["plan_status"],
+        }
+        near = _nearest_place(d["lat"], d["lon"])
+        if near:
+            entry["near"] = near
+        summary.append(entry)
+    # Pre-summed so the model never has to add the per-device figures itself —
+    # small models are unreliable at multi-step arithmetic (confirmed: asked
+    # for "a summary of distance traveled of all devices", it reported a
+    # single total that didn't match the sum of the very numbers it was given).
+    total_distance = sum(e["distance_miles"] or 0 for e in summary)
+    window_label = f"last {days} days" if days is not None else "all-time"
+    return {
+        "device_count": len(devices), "devices_by_group": by_group,
+        "distance_window": window_label,
+        "fleet_total_distance_miles": round(total_distance, 2),
+        "devices": summary[:50],
+    }
+
+
+def _mentioned_device(messages: list[dict], visible_devices: list[dict]):
+    """Simple name/uuid substring match — decides whether to compute one
+    device's full insight (deep) or leave it at the cheap fleet roll-up. Not a
+    rigid intent classifier; just bounds how much a single question costs.
+
+    Searches backward from the most recent message, not just the latest one —
+    a natural follow-up often doesn't repeat the device name (confirmed by a
+    real failure: "How far did test travel since 2026-09-01?" named it, but
+    the next turn, "what about since 2026-09-14 to today", didn't — and with
+    only the latest message checked, that follow-up got no device match at
+    all, so no movement data was ever computed for it to answer from, even
+    though the fleet digest's cadence data for every device was right there).
+    Stops at the first message (scanning newest-first) that names a device,
+    so the most recently discussed one wins if more than one has come up."""
+    for msg in reversed(messages):
+        content = (msg.get("content") or "").lower()
+        for d in visible_devices:
+            if (d["name"] and d["name"].lower() in content) or (d["uuid"] and d["uuid"].lower() in content):
+                return d
+    return None
+
+
+_AI_SYSTEM_PROMPT = (
+    "You are an assistant embedded in a BLE device tracking dashboard, answering "
+    "questions for the person using it about the devices they can see. You have "
+    "NO information about any device, label, or activity yet — you must call one "
+    "of the provided tools to look up real data before answering anything "
+    "specific. Never invent device names, positions, label text, plan/destination "
+    "details, or statistics — only state what a tool actually returned. For "
+    "get_plan_status and get_plan_history specifically: 'destination_radius_miles' "
+    "(the plan's own declared proximity radius) and 'destination_near.distance_miles' "
+    "(how far the nearest known city is FROM that destination) are two different numbers "
+    "that happen to both be in miles — never conflate them or imply one when "
+    "asked for the other. If a tool returns an error (e.g. "
+    "device not found) or an empty result, say so in plain terms, the way a "
+    "knowledgeable assistant would — never refer to 'the tool', 'the function', "
+    "'the JSON', or any other internal/technical term for how you got the "
+    "information; the person you're talking to has no idea that's how it works. "
+    "None of the tools return exact GPS coordinates — only an approximate "
+    "nearest place name and distance — so if asked for exact/precise "
+    "coordinates, say plainly that you can give an approximate location but not "
+    "exact coordinates through these tools. Whenever a tool's result includes "
+    "a 'near' object, its 'label' field is a COMPLETE, ready-made phrase "
+    "already including the distance and the 'about N miles from' wording — "
+    "insert it into your sentence AS ONE WHOLE UNIT, in that exact order, "
+    "every time you "
+    "state a place — e.g. 'about 3.4 miles from Dover, Delaware, United "
+    "States' or 'about 6.4 miles from Gibsonton, Florida, United States "
+    "(~7.2 miles from Tampa, Florida, United States)'. Never shorten it, "
+    "drop any part of it (the state, or the parenthetical secondary city "
+    "when present), reorder its pieces, restate the distance again yourself "
+    "before or after it, reconstruct your own version from the other near.* "
+    "fields (name/admin1/country/distance_miles — those exist only for your "
+    "own reference, never for you to re-assemble into text), or add a "
+    "state/region that isn't already in it — there are multiple real places "
+    "with the same name in different states/countries, e.g. several "
+    "'Dover's across different US states, and 'label' already resolves that "
+    "correctly; adding your own guess on top is inventing information just "
+    "as much as inventing a position or statistic would be. "
+    "Write in plain, natural prose for a "
+    "human reader — never quote field names (e.g. say 'last reported 3 hours "
+    "ago', not 'minutes_since_last_fix is 180') and never show raw JSON. All "
+    "distances returned by tools are already in MILES — state them as miles, "
+    "never kilometers, and never convert them yourself. When describing a "
+    "device's location, phrase the nearest place as an approximation (e.g. "
+    "'near', 'about N miles from'), never as if the device is exactly there. "
+    "For a question about multiple or all devices, call list_devices. When a "
+    "question names a relative period (e.g. 'last 30 days', 'the last 99 "
+    "days', 'this week'), compute start_date/end_date for tool calls using "
+    "the real current date given to you above — never estimate, assume, or "
+    "fall back to your own sense of today's date, which will be wrong. "
+    "Never add the per-device numbers yourself, you will get it wrong. "
+    "Be concise and direct — EXCEPT for a near.label value, which must always "
+    "be quoted completely, including any parenthetical secondary-city part "
+    "(e.g. '(~7.2 miles from Tampa, Florida, United States)') — trimming it "
+    "for brevity drops real information (a bigger, more recognizable "
+    "reference point) just as much as dropping the state would."
+)
+
+
+def _resolve_device(name_or_uuid, visible_devices: list[dict]):
+    """Matches a model-supplied device argument against the devices this
+    session can actually see — exact name/uuid match first, then a lenient
+    substring fallback. Returns None if nothing matches, same as any other
+    not-found case; callers must never fall back to assuming a device exists
+    just because the model named one, since that name is untrusted model
+    output, no different from user input."""
+    needle = (name_or_uuid or "").strip().lower()
+    if not needle:
+        return None
+    for d in visible_devices:
+        if (d["name"] and d["name"].lower() == needle) or (d["uuid"] and d["uuid"].lower() == needle):
+            return d
+    for d in visible_devices:
+        if d["name"] and needle in d["name"].lower():
+            return d
+    return None
+
+
+def _resolve_user(name_or_username):
+    """Matches a model-supplied person reference (for get_audit_log) against
+    real accounts by username OR first+last display name — same spirit as
+    _resolve_device(). Closes a confirmed real gap: asked "did Tho Pham log
+    in", the model had no way to know that's the display name for username
+    'tpham' — audit_log only ever stores the raw username, never
+    first_name/last_name, so there was nothing to match against. Admin-only
+    by construction: only called from _tool_get_audit_log(), which already
+    checks session.get("is_admin") before this ever runs."""
+    needle = (name_or_username or "").strip().lower()
+    if not needle:
+        return None
+    with sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        rows = con.execute("SELECT username, first_name, last_name FROM users").fetchall()
+    for r in rows:
+        if r["username"].lower() == needle:
+            return r["username"]
+    for r in rows:
+        full = f"{r['first_name'] or ''} {r['last_name'] or ''}".strip().lower()
+        if full and needle in full:
+            return r["username"]
+    return None
+
+
+def _tool_list_devices(args: dict) -> dict:
+    raw_days = args.get("days")
+    # 0 explicitly means all-time; omitted/falsy means the 30-day default;
+    # anything else is used as given — matches compute_distance's existing
+    # start_date/end_date pattern of letting the model pass the real period
+    # asked about rather than being stuck with one hardcoded window.
+    days = None if raw_days == 0 else (int(raw_days) if raw_days else 30)
+    return _fleet_digest(days=days)
+
+
+def _tool_get_device_status(args: dict) -> dict:
+    d = _resolve_device(args.get("device"), _visible_devices())
+    if not d:
+        return {"error": "device not found"}
+    near = _nearest_place(d["lat"], d["lon"])
+    result = {"name": d["name"], "uuid": d["uuid"], "group": d["group_name"],
+              "fix_count": d["fix_count"], "last_seen": d["last_seen"],
+              **_device_cadence(d["uuid"]), **_device_signal_quality(d["uuid"])}
+    if near:
+        result["near"] = near
+    # Scoped to one device, so (unlike list_devices' fleet-wide digest) the
+    # full plan detail is cheap enough to include directly rather than
+    # making the model issue a separate get_plan_status call for something
+    # this tool is already supposed to be the complete picture of.
+    result["plan"] = _tool_get_plan_status({"device": d["uuid"]})
+    return result
+
+
+def _tool_compute_distance(args: dict) -> dict:
+    d = _resolve_device(args.get("device"), _visible_devices())
+    if not d:
+        return {"error": "device not found"}
+    date_range = None
+    start_date, end_date = args.get("start_date"), args.get("end_date")
+    if start_date or end_date:
+        try:
+            start = datetime.strptime(start_date, "%Y-%m-%d") if start_date else datetime.min
+            end = (datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)) if end_date else \
+                datetime.now(timezone.utc).replace(tzinfo=None)
+        except ValueError:
+            return {"error": "start_date/end_date must be in YYYY-MM-DD format"}
+        date_range = (start, end, f"{start_date or 'the beginning'} to {end_date or 'now'}")
+    insight = _device_insight(d["uuid"], deep=True, date_range=date_range)
+    # Never send raw coordinates to the model — first/last position keep only
+    # the timestamp and the resolved place-name approximation. Exact
+    # coordinates are handled entirely outside the model — see
+    # _try_exact_location_shortcut().
+    for key in ("first_position", "last_position"):
+        if isinstance(insight.get(key), dict):
+            insight[key] = {"obs_time": insight[key].get("obs_time"), "near": insight[key].get("near")}
+    return {"name": d["name"], "uuid": d["uuid"], **insight}
+
+
+def _tool_search_labels(args: dict) -> dict:
+    visible = _visible_devices()
+    device_filter = args.get("device")
+    if device_filter:
+        d = _resolve_device(device_filter, visible)
+        devices = [d] if d else []
+    else:
+        devices = visible
+    keyword = (args.get("keyword") or "").lower()
+    matches = []
+    with sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        for d in devices:
+            labels = con.execute("SELECT * FROM device_labels WHERE uuid = ? ORDER BY created_at", (d["uuid"],)).fetchall()
+            for label in labels:
+                if not _label_accessible(con, label, d["uuid"]):
+                    continue
+                if keyword in label["text"].lower():
+                    matches.append({"device": d["name"], "uuid": d["uuid"], "text": label["text"]})
+    return {"matches": matches}
+
+
+def _tool_get_plan_status(args: dict) -> dict:
+    """Smart Tracking — reports a device's declared plan, if any, including
+    its deterministically-computed status (see _compute_plan_status(): plain
+    math/SQL, never the model). Narration only, same as every other tool:
+    the model reports what this function already decided, it never does its
+    own overdue/moving-away judgment from the raw ETA/position facts — see
+    the system prompt's explicit instruction not to infer a status beyond
+    what `status`/`is_overdue`/`is_moving_away` already say. RBAC is just
+    _resolve_device() against _visible_devices(), same as every other
+    device-scoped tool — plan visibility deliberately matches device
+    visibility exactly, no separate check the way private labels need
+    _label_accessible().
+
+    Never returns dest_lat/dest_lon — same no-raw-coordinates rule as
+    everywhere else. The destination is resolved through _nearest_place()
+    (reusing the exact same reverse-geocoding and pre-composed `label` field
+    used for live positions) into `destination_near`, which is a DIFFERENT
+    distance than `destination_radius_miles`: the former is how far the
+    nearest known city is FROM the destination's center point, the latter is
+    the plan's own declared proximity radius — two unrelated numbers that
+    happen to both be in miles, kept as clearly separate fields so they
+    can't get conflated when narrated (the system prompt also calls this out
+    explicitly)."""
+    d = _resolve_device(args.get("device"), _visible_devices())
+    if not d:
+        return {"error": "device not found"}
+    with sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        row = con.execute("""
+            SELECT dp.*, u.username AS created_by_username
+            FROM device_plans dp LEFT JOIN users u ON u.id = dp.created_by
+            WHERE dp.uuid = ?
+        """, (d["uuid"],)).fetchone()
+    if not row:
+        return {"name": d["name"], "uuid": d["uuid"], "has_plan": False}
+    return {
+        "name": d["name"], "uuid": d["uuid"], "has_plan": True,
+        "destination_radius_miles": row["radius_miles"],
+        "destination_near": _nearest_place(row["dest_lat"], row["dest_lon"]),
+        "start_date": row["start_date"], "eta_start": row["eta_start"], "eta_end": row["eta_end"],
+        **_compute_plan_status(d["uuid"], row, d["lat"], d["lon"]),
+        "declared_by": row["created_by_username"],
+        "declared_at": row["created_at"], "last_updated_at": row["updated_at"],
+    }
+
+
+def _tool_get_plan_history(args: dict) -> dict:
+    """Smart Tracking — a device's full plan change history (create/update/
+    delete), never discarded even after the current plan is edited or
+    removed — see device_plan_history. Same RBAC as get_plan_status:
+    _resolve_device() against _visible_devices(), no separate check, since
+    plan history visibility matches device visibility exactly like the live
+    plan does. Never returns raw dest_lat/dest_lon to the model — same rule
+    as every other location-adjacent tool — each entry's destination is
+    resolved through _nearest_place() into the same destination_near/
+    destination_radius_miles shape get_plan_status uses, so the two tools
+    read consistently and the same distance-conflation warning in the
+    system prompt applies to both."""
+    d = _resolve_device(args.get("device"), _visible_devices())
+    if not d:
+        return {"error": "device not found"}
+    limit = min(int(args.get("limit") or 10), 50)
+    with sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        rows = con.execute("""
+            SELECT h.*, u.username AS changed_by_username
+            FROM device_plan_history h LEFT JOIN users u ON u.id = h.changed_by
+            WHERE h.uuid = ? ORDER BY h.changed_at DESC LIMIT ?
+        """, (d["uuid"], limit)).fetchall()
+    entries = [{
+        "action": r["action"], "outcome": r["outcome"],
+        "destination_radius_miles": r["radius_miles"],
+        "destination_near": _nearest_place(r["dest_lat"], r["dest_lon"]),
+        "start_date": r["start_date"], "eta_start": r["eta_start"], "eta_end": r["eta_end"],
+        "changed_by": r["changed_by_username"], "changed_at": r["changed_at"],
+    } for r in rows]
+    return {"name": d["name"], "uuid": d["uuid"], "entries": entries}
+
+
+def _tool_get_audit_log(args: dict) -> dict:
+    # Checked here, at the point of use — not a keyword-triggered guess like
+    # the old design — so a non-admin's tool call is rejected outright
+    # regardless of what the model asks for.
+    if not session.get("is_admin"):
+        return {"error": "admin privileges required"}
+    limit = min(int(args.get("limit") or 50), 500)
+    query = "SELECT ts, username, action, target, detail FROM audit_log WHERE 1=1"
+    params = []
+    if not session.get("is_super_admin"):
+        # Same restriction as GET /api/admin/audit-log — the super admin's
+        # own activity is visible only to itself, so a regular admin asking
+        # Goby about it must get the same filtered view the Activity Log
+        # page would show them, not an unfiltered one through a back door.
+        query += " AND username NOT IN (SELECT username FROM users WHERE is_super_admin = 1)"
+    username_filter = args.get("username")
+    if username_filter:
+        # Resolves a display name ("Tho Pham") to the real username audit_log
+        # actually stores ("tpham") — audit_log has no first_name/last_name of
+        # its own, so without this a person-name question silently matches
+        # nothing. See _resolve_user().
+        resolved = _resolve_user(username_filter)
+        if not resolved:
+            return {"error": f"no user matching '{username_filter}'"}
+        query += " AND username = ?"
+        params.append(resolved)
+    action_filter = args.get("action")
+    if action_filter:
+        # Without this, a "who logged in" question pulls from a window that
+        # includes every action type — confirmed live: ai.tool_call/ai.ask
+        # rows from Ask Goby's own usage dominate a recent date range (20+18
+        # of a 50-row window in one real test), crowding out the small
+        # number of actual login rows even when the date range is correct.
+        query += " AND action = ?"
+        params.append(action_filter)
+    start_date, end_date = args.get("start_date"), args.get("end_date")
+    if start_date:
+        query += " AND ts >= ?"
+        params.append(start_date)
+    if end_date:
+        try:
+            end_dt = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
+        except ValueError:
+            return {"error": "end_date must be in YYYY-MM-DD format"}
+        query += " AND ts < ?"
+        params.append(end_dt.strftime("%Y-%m-%d %H:%M:%S"))
+    query += " ORDER BY ts DESC LIMIT ?"
+    params.append(limit)
+    with sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        rows = con.execute(query, params).fetchall()
+    return {"rows": [dict(r) for r in rows]}
+
+
+def _tool_get_reporting_gaps(args: dict) -> dict:
+    """Added after a confirmed real gap: asked "what's the second longest
+    interval of 6ZG0P0?", the model correctly declined rather than guessing —
+    get_device_status only ever exposed the median ("typical") gap and the
+    current one, never the actual list of historical gaps, so there was
+    nothing for it to answer from. This computes every real consecutive gap
+    for a device and returns the largest N, oldest-history included (not
+    bounded to recent fixes like _device_cadence's baseline, since 'second
+    longest ever' needs the full history, not just a recent sample)."""
+    d = _resolve_device(args.get("device"), _visible_devices())
+    if not d:
+        return {"error": "device not found"}
+    limit = min(int(args.get("limit") or 5), 20)
+    with sqlite3.connect(DB_PATH) as con:
+        rows = con.execute(
+            "SELECT obs_time FROM observations WHERE uuid = ? ORDER BY obs_time", (d["uuid"],)
+        ).fetchall()
+    times = [t for t in (_parse_obs_time(r[0]) for r in rows) if t]
+    gaps = []
+    for i in range(1, len(times)):
+        gap_minutes = (times[i] - times[i - 1]).total_seconds() / 60
+        gaps.append({
+            "gap_minutes": round(gap_minutes, 1),
+            "gap_hours": round(gap_minutes / 60, 1),
+            "from": times[i - 1].strftime("%Y-%m-%d %H:%M:%S"),
+            "to": times[i].strftime("%Y-%m-%d %H:%M:%S"),
+        })
+    gaps.sort(key=lambda g: g["gap_minutes"], reverse=True)
+    return {"name": d["name"], "uuid": d["uuid"], "total_fixes": len(times),
+            "largest_gaps": gaps[:limit]}
+
+
+_AI_TOOL_DISPATCH = {
+    "list_devices": _tool_list_devices,
+    "get_device_status": _tool_get_device_status,
+    "compute_distance": _tool_compute_distance,
+    "search_labels": _tool_search_labels,
+    "get_audit_log": _tool_get_audit_log,
+    "get_reporting_gaps": _tool_get_reporting_gaps,
+    "get_plan_status": _tool_get_plan_status,
+    "get_plan_history": _tool_get_plan_history,
+}
+
+_AI_TOOLS = [
+    {"type": "function", "function": {
+        "name": "list_devices",
+        "description": "List every device visible to the current user, with group, fix count, last-seen time, approximate location, cadence/staleness, average confidence/accuracy, distance traveled over a given window (plus a combined fleet total), and plan_status ('on_track'/'overdue'/'moving_away', or null if the device has no Smart Tracking plan). plan_status alone is already enough for 'which devices are overdue/on track/moving away' — only call get_plan_status for a device's actual destination/ETA detail.",
+        "parameters": {"type": "object", "properties": {
+            "days": {"type": "integer", "description": "How many days back to compute distance traveled over. Default 30 if omitted. Pass 0 for all-time."},
+        }},
+    }},
+    {"type": "function", "function": {
+        "name": "get_device_status",
+        "description": "Cadence/staleness, average confidence/accuracy, approximate current location, and full Smart Tracking plan detail (destination, ETA, computed status) for one specific device — already includes everything get_plan_status would return for this device, under the 'plan' field (plan.has_plan is false if none exists), so there's no need to call get_plan_status separately after this for the same device.",
+        "parameters": {"type": "object", "properties": {
+            "device": {"type": "string", "description": "Device name or UUID"},
+        }, "required": ["device"]},
+    }},
+    {"type": "function", "function": {
+        "name": "compute_distance",
+        "description": "Distance traveled, movement pattern, and dwell/stop time for one device, optionally within a date range.",
+        "parameters": {"type": "object", "properties": {
+            "device": {"type": "string", "description": "Device name or UUID"},
+            "start_date": {"type": "string", "description": "ISO 8601 date, e.g. 2026-09-01. Omit for all-time."},
+            "end_date": {"type": "string", "description": "ISO 8601 date. Omit to mean through now."},
+        }, "required": ["device"]},
+    }},
+    {"type": "function", "function": {
+        "name": "search_labels",
+        "description": "Search label text across visible devices, optionally scoped to one device. Omit keyword to list all labels.",
+        "parameters": {"type": "object", "properties": {
+            "keyword": {"type": "string"},
+            "device": {"type": "string", "description": "Optional — limit to one device's labels"},
+        }},
+    }},
+    {"type": "function", "function": {
+        "name": "get_audit_log",
+        "description": "Administrative activity log (logins, admin changes, etc). Only works for admin users — returns an error for everyone else. This log records many unrelated action types, not just logins — always pass action='login' for any question about who logged in/last logged in, otherwise other activity (especially Ask Goby's own tool-call logging) can crowd real login events out of the row cap even within the right date range. Always pass start_date/end_date too when the question names a time period (e.g. 'last 7 days', 'last 30 days') rather than relying on limit alone. Use username to scope to one person — pass whatever name or username form the question used (e.g. 'Tho Pham' or 'tpham'); it is resolved against real accounts automatically.",
+        "parameters": {"type": "object", "properties": {
+            "limit": {"type": "integer", "description": "Max rows to return, default 50, capped at 500"},
+            "username": {"type": "string", "description": "Optional — a person's display name or username to filter to, e.g. 'Tho Pham' or 'tpham'"},
+            "action": {"type": "string", "description": "Optional — exact action type to filter to. Use 'login' for login-history questions. Other values seen in this system: logout, login_failed, password_change, user.create, user.update, user.password_reset, group.update, device.archive, device.delete, device.access_update, label.create, label.update, label.delete, ai.ask, ai.tool_call, ai.enabled_toggle, ai.history_clear."},
+            "start_date": {"type": "string", "description": "Optional — YYYY-MM-DD, inclusive start of the date range"},
+            "end_date": {"type": "string", "description": "Optional — YYYY-MM-DD, inclusive end of the date range"},
+        }},
+    }},
+    {"type": "function", "function": {
+        "name": "get_reporting_gaps",
+        "description": "The largest historical gaps (in minutes) between consecutive fixes for one device, across its entire history — e.g. for questions about the longest, second-longest, or N largest reporting gaps it has ever had. Different from get_device_status, which only gives the typical/median gap and the current one, not historical outliers.",
+        "parameters": {"type": "object", "properties": {
+            "device": {"type": "string", "description": "Device name or UUID"},
+            "limit": {"type": "integer", "description": "How many of the largest gaps to return, default 5"},
+        }, "required": ["device"]},
+    }},
+    {"type": "function", "function": {
+        "name": "get_plan_status",
+        "description": "A device's declared Smart Tracking plan, if any — its destination (as an approximate place + proximity radius, never exact coordinates), start_date (when the plan began), ETA window, and computed status. Use for any question about a device's plan, destination, when its plan started, where it's headed, when it's expected, or whether it's on track/overdue/moving away. has_plan is false if no plan was ever declared for this device — say so plainly, don't treat that as an error. The 'status' field ('on_track'/'overdue'/'moving_away') plus 'is_overdue'/'is_moving_away' are already fully computed — always use these directly, never compute your own overdue/on-track judgment from eta_start/eta_end and today's date, and never describe a status this tool didn't return (e.g. don't say 'moving away' unless is_moving_away is true).",
+        "parameters": {"type": "object", "properties": {
+            "device": {"type": "string", "description": "Device name or UUID"},
+        }, "required": ["device"]},
+    }},
+    {"type": "function", "function": {
+        "name": "get_plan_history",
+        "description": "A device's full Smart Tracking plan change history — every past create/update/delete, newest first, including entries for a plan that was later edited or removed (device_plans itself only ever holds the CURRENT plan; this is the only way to answer 'what was this device's previous destination/plan'). A 'deleted' entry's 'outcome' field says why it ended: 'arrived' (manually marked as reaching its destination), 'cancelled' (ended some other way), or null (an older entry from before this distinction existed, or a plan still active — a 'created'/'updated' row is never an ending at all). Use for any question about a device's past plans, previous destinations, whether a past plan was completed vs. cancelled, or how its plan has changed over time — NOT for its current plan (use get_plan_status for that). Each entry's destination is resolved the same way as get_plan_status (approximate place + radius, never exact coordinates).",
+        "parameters": {"type": "object", "properties": {
+            "device": {"type": "string", "description": "Device name or UUID"},
+            "limit": {"type": "integer", "description": "Max entries to return, default 10, capped at 50"},
+        }, "required": ["device"]},
+    }},
+]
+
+_EXACT_LOCATION_RE = re.compile(
+    r"\b(exact|precise|specific)\s+(location|position|coordinates?|gps)\b"
+    r"|\bgps\s+coordinates?\b"
+    r"|\blat(?:itude)?\s*(?:and|/|,)?\s*lon(?:gitude)?\b"
+)
+
+
+def _exact_location_lookup(uuid: str, date_range=None):
+    """Raw lat/lon straight from the database. This is the ONLY function in
+    the entire AI assistant pipeline allowed to produce exact coordinates,
+    and it is never exposed to the model as a tool — see
+    _try_exact_location_shortcut(), which calls this directly and answers
+    without any LLM involvement at all, so real coordinates can never be
+    sent to an external API regardless of which one is configured."""
+    with sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        if date_range:
+            start, end, _ = date_range
+            row = con.execute(
+                "SELECT lat, lon, obs_time FROM observations WHERE uuid = ? AND obs_time BETWEEN ? AND ? "
+                "ORDER BY obs_time DESC LIMIT 1",
+                (uuid, start.strftime("%Y-%m-%d %H:%M:%S"), end.strftime("%Y-%m-%d %H:%M:%S")),
+            ).fetchone()
+        else:
+            row = con.execute(
+                "SELECT lat, lon, obs_time FROM observations WHERE uuid = ? ORDER BY obs_time DESC LIMIT 1",
+                (uuid,),
+            ).fetchone()
+    return dict(row) if row else None
+
+
+def _try_exact_location_shortcut(question: str, messages: list[dict]):
+    """Returns a plain-text answer if this question is specifically an
+    exact-coordinates request for an identifiable device, else None (falls
+    through to the normal tool-calling pipeline, where the model has no tool
+    capable of returning exact coordinates at all — see _AI_SYSTEM_PROMPT).
+    Runs entirely locally, with no LLM call, so this is the one path allowed
+    to state real coordinates."""
+    if not _EXACT_LOCATION_RE.search(question.lower()):
+        return None
+    device = _mentioned_device(messages, _visible_devices())
+    if not device:
+        return None
+    date_range = _extract_date_range(question)
+    pos = _exact_location_lookup(device["uuid"], date_range)
+    if not pos:
+        suffix = " in that window." if date_range else "."
+        return f"I don't have any recorded position for \"{device['name']}\"{suffix}"
+    lat, lon = pos["lat"], pos["lon"]
+    ns, ew = ("N" if lat >= 0 else "S"), ("E" if lon >= 0 else "W")
+    when = f"at {pos['obs_time']}" if date_range else f"(last known, {pos['obs_time']})"
+    return (f"The exact location of \"{device['name']}\" {when} is "
+            f"{abs(lat):.7f}° {ns}, {abs(lon):.7f}° {ew}.")
+
+
+@app.route("/api/ai/ask", methods=["POST"])
+@login_required
+def ai_ask():
+    if not _ai_feature_enabled():
+        return jsonify({"error": "Goby is not available right now"}), 503
+    if not _user_ai_allowed(session["user_id"]):
+        return jsonify({"error": "Goby has been disabled for your account"}), 403
+    data = request.get_json(force=True, silent=True) or {}
+    history = data.get("messages") or []
+    if not history or not isinstance(history, list) or not history[-1].get("content"):
+        return jsonify({"error": "messages is required"}), 400
+    question = str(history[-1]["content"]).strip()
+    if not question:
+        return jsonify({"error": "empty question"}), 400
+    if len(question) > 2000:
+        return jsonify({"error": "question too long"}), 400
+    history = [{"role": m.get("role"), "content": m.get("content")} for m in history[-12:]]
+
+    # Exact-coordinate requests are answered directly from the database and
+    # never reach the model — checked before the concurrency semaphore since
+    # this path makes no LLM call at all and shouldn't consume a scarce slot.
+    shortcut_answer = _try_exact_location_shortcut(question, history)
+
+    if shortcut_answer is None and not _AI_SEMAPHORE.acquire(blocking=False):
+        return jsonify({"error": "Goby is busy, try again shortly"}), 429
+
+    def generate():
+        full_answer = ""
+        try:
+            if shortcut_answer is not None:
+                full_answer = shortcut_answer
+                yield f"data: {json.dumps({'delta': shortcut_answer})}\n\n"
+            else:
+                # The model has no reliable way to know the real current date
+                # on its own — confirmed live: asked for "the last 99 days",
+                # it computed an internally-consistent 99-day span but anchored
+                # it to a guessed "today" 11 days in the future, silently
+                # skewing every relative-date tool argument it would compute.
+                # Grounding "now" here fixes it the same way every other fact
+                # is grounded — give it the real value, don't make it guess.
+                today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                system_msg = {"role": "system", "content": f"Today's date is {today_str} (UTC). {_AI_SYSTEM_PROMPT}"}
+                for piece in _llm_chat_with_tools([system_msg, *history]):
+                    full_answer += piece
+                    yield f"data: {json.dumps({'delta': piece})}\n\n"
+            with sqlite3.connect(DB_PATH) as con:
+                con.execute(
+                    "INSERT INTO ai_messages (user_id, username, role, content) VALUES (?, ?, 'user', ?)",
+                    (session["user_id"], session.get("username"), question),
+                )
+                con.execute(
+                    "INSERT INTO ai_messages (user_id, username, role, content) VALUES (?, ?, 'assistant', ?)",
+                    (session["user_id"], session.get("username"), full_answer),
+                )
+                con.commit()
+            log_activity("ai.ask", target=session.get("username"), detail=f"len={len(full_answer)}")
+            yield "data: [DONE]\n\n"
+        except requests.exceptions.Timeout:
+            logging.exception("AI assistant request timed out")
+            yield f"data: {json.dumps({'error': 'Goby took too long to respond (it may still be loading the model) — try again in a moment.'})}\n\n"
+        except requests.exceptions.ConnectionError:
+            logging.exception("AI assistant request failed to connect")
+            yield f"data: {json.dumps({'error': 'Could not reach Goby. Check that the LLM backend is running and LLM_API_BASE_URL is correct.'})}\n\n"
+        except Exception:
+            # Covers requests.HTTPError (non-200) and anything else — the real
+            # exception is still in the server log for an admin to diagnose;
+            # the user only sees a safe, generic message, never a raw stack trace.
+            logging.exception("AI assistant request failed")
+            yield f"data: {json.dumps({'error': 'Goby hit an unexpected error. Please try again.'})}\n\n"
+        finally:
+            # Only release if the shortcut path didn't skip acquiring it —
+            # releasing a slot that was never taken would incorrectly let the
+            # semaphore exceed its real capacity.
+            if shortcut_answer is None:
+                _AI_SEMAPHORE.release()
+
+    return Response(stream_with_context(generate()), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.route("/api/ai/history")
+@login_required
+def ai_history():
+    limit = min(int(request.args.get("limit", 50)), 100)
+    with sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            "SELECT role, content, created_at FROM ai_messages WHERE user_id = ? ORDER BY created_at ASC LIMIT ?",
+            (session["user_id"], limit),
+        ).fetchall()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route("/api/ai/history", methods=["DELETE"])
+@login_required
+def clear_ai_history():
+    """Lets a user delete their own Ask Goby conversation history on demand —
+    scoped to session["user_id"] only, same as the GET above; there is no
+    route for clearing another user's history, including for admins."""
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.execute("DELETE FROM ai_messages WHERE user_id = ?", (session["user_id"],))
+        con.commit()
+    log_activity("ai.history_clear", detail=f"rows_deleted={cur.rowcount}")
+    return jsonify({"ok": True, "rows_deleted": cur.rowcount})
+
+
 # --- Admin routes ---
 
 @app.route("/admin")
@@ -1052,7 +2650,7 @@ def admin_users():
         with sqlite3.connect(DB_PATH) as con:
             con.row_factory = sqlite3.Row
             users = con.execute(
-                "SELECT id, username, first_name, last_name, is_admin, is_super_admin, created_at "
+                "SELECT id, username, first_name, last_name, is_admin, is_super_admin, ai_access, created_at "
                 "FROM users ORDER BY username"
             ).fetchall()
             groups_by_user: dict[int, list] = {}
@@ -1065,6 +2663,7 @@ def admin_users():
             "id": u["id"], "username": u["username"],
             "first_name": u["first_name"], "last_name": u["last_name"],
             "is_admin": bool(u["is_admin"]), "is_super_admin": bool(u["is_super_admin"]),
+            "ai_access": bool(u["ai_access"]),
             "created_at": u["created_at"], "groups": groups_by_user.get(u["id"], []),
         } for u in users])
 
@@ -1081,7 +2680,14 @@ def admin_users():
     with sqlite3.connect(DB_PATH) as con:
         try:
             cur = con.execute(
-                "INSERT INTO users (username, password_hash, first_name, last_name, is_admin) VALUES (?, ?, ?, ?, ?)",
+                # ai_access explicitly 0 here, overriding the column's own
+                # DEFAULT 1 — that default exists only so the ALTER TABLE
+                # migration doesn't retroactively cut off users who existed
+                # before this feature; a brand new user was never using Ask
+                # Goby, so there's nothing to preserve, and the super admin
+                # must now opt each one in deliberately.
+                "INSERT INTO users (username, password_hash, first_name, last_name, is_admin, ai_access) "
+                "VALUES (?, ?, ?, ?, ?, 0)",
                 (username, generate_password_hash(password), first_name, last_name, int(is_admin)),
             )
         except sqlite3.IntegrityError:
@@ -1103,10 +2709,17 @@ def admin_update_user(user_id):
     if _super_admin_protected(user_id):
         return jsonify({"error": "the super admin account can only be modified by itself"}), 403
     data = request.get_json(force=True, silent=True) or {}
+    if "ai_access" in data and not session.get("is_super_admin"):
+        # Per-user Ask Goby access is deliberately scoped tighter than every
+        # other field this route accepts — admin_required (any admin) gates
+        # the route itself, but this one field is super-admin-only, same
+        # no-exceptions pattern as the AI runtime toggle (PATCH
+        # /api/admin/ai-settings) and private-device ownership.
+        return jsonify({"error": "super admin privileges required"}), 403
     with sqlite3.connect(DB_PATH) as con:
         target_row = con.execute("SELECT username FROM users WHERE id = ?", (user_id,)).fetchone()
         target_username = target_row[0] if target_row else str(user_id)
-        changed = [f for f in ("first_name", "last_name", "is_admin", "group_ids") if f in data]
+        changed = [f for f in ("first_name", "last_name", "is_admin", "group_ids", "ai_access") if f in data]
 
         if "first_name" in data:
             con.execute("UPDATE users SET first_name = ? WHERE id = ?",
@@ -1146,6 +2759,9 @@ def admin_update_user(user_id):
                     "INSERT OR IGNORE INTO user_groups (user_id, group_id) VALUES (?, ?)",
                     (user_id, gid),
                 )
+        if "ai_access" in data:
+            con.execute("UPDATE users SET ai_access = ? WHERE id = ?",
+                        (1 if data["ai_access"] else 0, user_id))
         con.commit()
     log_activity("user.update", target=target_username, detail=f"fields={','.join(changed)}")
     return jsonify({"ok": True})
@@ -1457,12 +3073,21 @@ def admin_update_device(uuid):
 @admin_required
 def admin_audit_log():
     limit = min(int(request.args.get("limit", 200)), 1000)
+    query = "SELECT id, ts, username, action, target, detail, ip FROM audit_log WHERE 1=1"
+    params = []
+    if not session.get("is_super_admin"):
+        # The super admin's own activity (including login_failed attempts
+        # logged under its literal username pre-auth) is visible only to
+        # itself — a regular admin sees every other admin's activity but
+        # never this. Matched by username against the real users table
+        # rather than a hardcoded "admin" literal, same reasoning as every
+        # other is_super_admin check in this app.
+        query += " AND username NOT IN (SELECT username FROM users WHERE is_super_admin = 1)"
+    query += " ORDER BY id DESC LIMIT ?"
+    params.append(limit)
     with sqlite3.connect(DB_PATH) as con:
         con.row_factory = sqlite3.Row
-        rows = con.execute(
-            "SELECT id, ts, username, action, target, detail, ip FROM audit_log ORDER BY id DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
+        rows = con.execute(query, params).fetchall()
     return jsonify([dict(r) for r in rows])
 
 
@@ -1470,6 +3095,71 @@ def admin_audit_log():
 @admin_required
 def admin_version():
     return jsonify({"app_version": APP_VERSION, "schema_version": SCHEMA_VERSION})
+
+
+@app.route("/api/admin/active-users")
+@admin_required
+def admin_active_users():
+    """Users considered 'currently logged on' — last_seen_at (touched by
+    _touch_last_seen() on every authenticated request on both pages) within
+    ACTIVE_USER_WINDOW_MINUTES. This is activity-based, not a real session
+    registry — there's no server-side session store to query (sessions are
+    plain signed cookies), so "active" here means "made a request recently,"
+    not "holds a cookie that hasn't expired yet." A user who closes their
+    browser without logging out will simply stop appearing here once they go
+    quiet, same as the dashboard's own online/offline feel elsewhere."""
+    minutes = int(request.args.get("minutes") or ACTIVE_USER_WINDOW_MINUTES)
+    query = """
+        SELECT username, is_admin, is_super_admin, last_seen_at
+        FROM users
+        WHERE last_seen_at >= datetime('now', ?)
+    """
+    params = [f"-{minutes} minutes"]
+    if not session.get("is_super_admin"):
+        # The super admin's own active-session presence is visible only to
+        # itself — same restriction as the audit log, for the same reason.
+        query += " AND is_super_admin = 0"
+    query += " ORDER BY last_seen_at DESC"
+    with sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        rows = con.execute(query, params).fetchall()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route("/api/admin/ai-settings")
+@admin_required
+def admin_get_ai_settings():
+    """Super-admin only — not just admin_required, which every other route in
+    this block uses, because this specific control was explicitly scoped to
+    the super admin account alone, same no-exceptions pattern as the private-
+    device override. `configured` (is an LLM endpoint set up at all, via
+    LLM_API_BASE_URL) is reported alongside `enabled` (the runtime toggle) so
+    the UI can show a meaningful state even when there's nothing to toggle
+    yet."""
+    if not session.get("is_super_admin"):
+        return jsonify({"error": "super admin privileges required"}), 403
+    with sqlite3.connect(DB_PATH) as con:
+        row = con.execute("SELECT value FROM app_settings WHERE key = 'ai_enabled'").fetchone()
+    return jsonify({"configured": _llm_configured(), "enabled": row is None or row[0] == "1"})
+
+
+@app.route("/api/admin/ai-settings", methods=["PATCH"])
+@admin_required
+def admin_set_ai_settings():
+    if not session.get("is_super_admin"):
+        return jsonify({"error": "super admin privileges required"}), 403
+    data = request.get_json(force=True, silent=True) or {}
+    if "enabled" not in data:
+        return jsonify({"error": "enabled is required"}), 400
+    enabled = bool(data["enabled"])
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute("""
+            INSERT INTO app_settings (key, value) VALUES ('ai_enabled', ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """, ("1" if enabled else "0",))
+        con.commit()
+    log_activity("ai.enabled_toggle", detail=f"enabled={enabled}")
+    return jsonify({"ok": True, "enabled": enabled})
 
 
 def _device_backup_payload(uuid: str) -> dict:
@@ -1496,6 +3186,16 @@ def _device_backup_payload(uuid: str) -> dict:
                 JOIN users u ON u.id = lu.user_id WHERE lu.label_id IN ({placeholders})
             """, label_ids).fetchall():
                 allowed_by_label.setdefault(lid, []).append(uname)
+        plan = con.execute("""
+            SELECT dest_lat, dest_lon, radius_miles, eta_start, eta_end, created_at, updated_at
+            FROM device_plans WHERE uuid = ?
+        """, (uuid,)).fetchone()
+        plan_history = con.execute("""
+            SELECT h.action, h.dest_lat, h.dest_lon, h.radius_miles, h.eta_start, h.eta_end,
+                   h.start_date, h.outcome, u.username AS changed_by_username, h.changed_at
+            FROM device_plan_history h LEFT JOIN users u ON u.id = h.changed_by
+            WHERE h.uuid = ? ORDER BY h.changed_at
+        """, (uuid,)).fetchall()
     return {
         "uuid": uuid,
         "backed_up_at": datetime.now(timezone.utc).isoformat(),
@@ -1506,6 +3206,8 @@ def _device_backup_payload(uuid: str) -> dict:
             "allowed_usernames": allowed_by_label.get(l["id"], []),
             "created_at": l["created_at"], "updated_at": l["updated_at"],
         } for l in labels],
+        "plan": dict(plan) if plan else None,
+        "plan_history": [dict(r) for r in plan_history],
     }
 
 
@@ -1568,6 +3270,8 @@ def delete_device_permanently(uuid):
             placeholders = ",".join("?" * len(label_ids))
             con.execute(f"DELETE FROM label_users WHERE label_id IN ({placeholders})", label_ids)
         con.execute("DELETE FROM device_labels WHERE uuid = ?", (uuid,))
+        con.execute("DELETE FROM device_plans WHERE uuid = ?", (uuid,))
+        con.execute("DELETE FROM device_plan_history WHERE uuid = ?", (uuid,))
         con.commit()
     log_activity("device.delete", target=uuid)
     return jsonify({"uuid": uuid, "deleted": True})
@@ -1577,6 +3281,7 @@ init_db()
 bootstrap_admin()
 threading.Thread(target=tcp_listener, daemon=True).start()
 threading.Thread(target=_audit_log_pruner, daemon=True).start()
+threading.Thread(target=_ai_history_pruner, daemon=True).start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=HTTP_PORT, threaded=True)

@@ -17,6 +17,9 @@ services:
       # SECRET_KEY: ""   # optional — if unset, a random key is generated once and
       #                   # persisted to /app/secret_key.txt (in the ./data volume)
       # AUDIT_LOG_RETENTION_DAYS: "90"   # optional — rows older than this are pruned daily; default 90
+      # AI_HISTORY_RETENTION_DAYS: "90"  # optional — Ask Goby chat history pruned daily; default 90
+      # SESSION_LIFETIME_HOURS: "3"         # optional — sliding inactivity timeout; default 3
+      # ACTIVE_USER_WINDOW_MINUTES: "15"    # optional — "active now" cutoff in Management; default 15
       # RESET_ADMIN_PASSWORD: "1"   # break-glass only: set this + ADMIN_PASSWORD to the new
       #                             # password, then `docker compose up -d`, then UNSET both
       #                             # (or at least this flag) before the next restart — the
@@ -27,3 +30,22 @@ services:
       # BASEMAP_WMS_URL: "https://maps.geo.nga.smil.mil/osm/wms/OSM_WORLD/basemap/OSM_BASEMAP/OSM_ENGLISH"
       # BASEMAP_WMS_LAYERS: "OSM_BASEMAP"   # optional, this is already the default
       # BASEMAP_ATTRIBUTION: "NGA OSM"      # optional, this is already the default
+      #
+      # Ask AI — unset LLM_API_BASE_URL (default) disables the feature
+      # entirely (button/panel absent from the UI, route 503s). Dev points at
+      # NVIDIA's hosted Nemotron (build.nvidia.com), same OpenAI-compatible
+      # wire format prod's self-hosted vLLM will use. LLM_API_KEY is read from
+      # the local .env file (NVIDIA_API_KEY=...), NOT committed — see
+      # .gitignore. NOTE: originally pointed at nemotron-3-super-120b-a12b,
+      # which NVIDIA retired from this hosted catalog on 2026-10-03 (confirmed
+      # via a live 410 Gone response) — confirm prod's own "Nemotron Super"
+      # plan is still valid given that, independent of this dev config.
+      # Current model below (Ultra 550B) was picked as the closest successor
+      # tier, not confirmed to match whatever prod ends up running.
+      LLM_API_BASE_URL: "https://integrate.api.nvidia.com/v1"
+      LLM_MODEL: "nvidia/nemotron-3-ultra-550b-a55b"
+      LLM_API_KEY: "${NVIDIA_API_KEY}"
+      # LLM_TIMEOUT_SECONDS: "60"    # optional, this is already the default
+      # LLM_MAX_CONCURRENT: "4"      # optional, this is already the default — bounds how many
+      #                              # /api/ai/ask streams can run at once (shares gunicorn's
+      #                              # thread pool with /stream — see gunicorn_config.py)

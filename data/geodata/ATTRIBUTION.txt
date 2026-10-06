@@ -1,0 +1,14 @@
+cities.csv is derived from the GeoNames geographical database
+(https://www.geonames.org/), specifically the "cities5000" export
+(all cities with a population >= 5000, or capitals of administrative
+divisions), trimmed to name/lat/lon/country/admin1/population. The
+`admin1` column (state/province/governorate — whatever a given country's
+top administrative subdivision is) is resolved from GeoNames' separate
+admin1CodesASCII.txt mapping (country.code -> name) and left blank for
+places with no such subdivision (e.g. city-states like Singapore).
+
+GeoNames data is licensed under a Creative Commons Attribution 4.0
+License: https://creativecommons.org/licenses/by/4.0/
+
+Downloaded from https://download.geonames.org/export/dump/cities5000.zip
+and https://download.geonames.org/export/dump/admin1CodesASCII.txt

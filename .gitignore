@@ -5,3 +5,5 @@ data/tracks.db
 data/tracks.db-shm
 data/tracks.db-wal
 data/secret_key.txt
+data/nvdia.txt
+.env
