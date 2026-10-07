@@ -394,6 +394,22 @@ html, body { height: 100%; font-family: 'Segoe UI', sans-serif; background: #0d1
 .ai-msg table.ai-table th { background: #161b22; font-weight: 600; }
 .ai-msg ul { margin: 2px 0 2px 18px; padding: 0; }
 #ai-empty { color: #8b949e; font-size: .78rem; padding: 12px; text-align: center; }
+/* Shown in the assistant bubble from the moment a question is sent until
+   the first streamed delta arrives — the tool-calling dispatch loop
+   (_llm_chat_with_tools(), up to 5 non-streaming rounds) can easily take
+   10-30s before anything reaches the browser, and the bubble was just
+   sitting there empty with zero indication Goby was still working. */
+.ai-typing { display: inline-flex; gap: 4px; padding: 2px 0; }
+.ai-typing span {
+  width: 6px; height: 6px; border-radius: 50%; background: #8b949e;
+  animation: ai-typing-bounce 1.2s ease-in-out infinite;
+}
+.ai-typing span:nth-child(2) { animation-delay: 0.2s; }
+.ai-typing span:nth-child(3) { animation-delay: 0.4s; }
+@keyframes ai-typing-bounce {
+  0%, 60%, 100% { opacity: 0.3; transform: translateY(0); }
+  30%           { opacity: 1;   transform: translateY(-3px); }
+}
 #ai-input-row { border-top: 1px solid #30363d; padding: 10px; display: flex; gap: 8px; flex-shrink: 0; }
 #ai-input {
   flex: 1; resize: none; height: 38px; max-height: 100px; padding: 8px 10px;
@@ -2010,6 +2026,9 @@ async function submitAiQuestion() {
   aiMessages.push({ role: 'user', content: question });
   appendAiBubble('user', question);
   const assistantBubble = appendAiBubble('assistant', '');
+  // Replaced wholesale by the first setAiBubbleText()/textContent write
+  // below (delta, error, or connection failure) — no separate removal needed.
+  assistantBubble.innerHTML = '<span class="ai-typing"><span></span><span></span><span></span></span>';
 
   try {
     const resp = await fetch('/api/ai/ask', {

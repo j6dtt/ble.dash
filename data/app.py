@@ -1591,7 +1591,23 @@ def _llm_chat_with_tools(messages: list[dict], max_rounds: int = 5):
             except ValueError:
                 fn_args = {}
             handler = _AI_TOOL_DISPATCH.get(fn_name)
-            result = handler(fn_args) if handler else {"error": f"unknown tool '{fn_name}'"}
+            if not handler:
+                result = {"error": f"unknown tool '{fn_name}'"}
+            else:
+                try:
+                    result = handler(fn_args)
+                except Exception:
+                    # A handful of tools do an unguarded int()/datetime.strptime()
+                    # on a model-supplied argument (limit, days, start_date) —
+                    # a malformed one previously propagated all the way up
+                    # through this generator and killed the WHOLE turn with a
+                    # generic "Goby hit an unexpected error", even though every
+                    # other tool call this round might have succeeded fine.
+                    # One bad argument should degrade to a per-tool error the
+                    # model can see and react to (retry without it, or say it
+                    # can't do that), not abort the entire answer.
+                    logging.exception("Ask Goby tool '%s' raised with args=%s", fn_name, fn_args)
+                    result = {"error": "that request couldn't be processed — try different or fewer parameters"}
             log_activity("ai.tool_call", target=fn_name, detail=f"args={json.dumps(fn_args, default=str)}")
             messages.append({
                 "role": "tool", "tool_call_id": call["id"],
@@ -1725,11 +1741,16 @@ def _nearest_place(lat, lon):
 
 
 def _position_snapshot(pt) -> dict:
-    """A single observation row as a position fact for the AI — raw lat/lon
-    (for when exact coordinates are asked for) plus the resolved nearest place
-    (for normal conversation), same dual representation as _fleet_digest()'s
-    per-device entries."""
-    snap = {"lat": pt["lat"], "lon": pt["lon"], "obs_time": pt["obs_time"]}
+    """A single observation row as a position fact for the AI — timestamp
+    plus the resolved nearest place, NEVER raw lat/lon. Same no-raw-
+    coordinates rule as every other tool-facing location field in this file
+    (_exact_location_lookup() is the only function allowed to produce real
+    coordinates, and only _try_exact_location_shortcut() may call it,
+    entirely outside the model/tool-calling pipeline) — enforced here at the
+    source rather than left to whichever caller happens to strip lat/lon
+    back out afterward, so a future caller of _device_insight(deep=True)
+    can't accidentally leak coordinates by forgetting to."""
+    snap = {"obs_time": pt["obs_time"]}
     near = _nearest_place(pt["lat"], pt["lon"])
     if near:
         snap["near"] = near
@@ -1778,6 +1799,26 @@ def _device_cadence(uuid: str) -> dict:
     return cadence
 
 
+def _plan_start_date(uuid: str) -> str | None:
+    """Raw YYYY-MM-DD start_date of the device's CURRENT Smart Tracking plan,
+    or None if it has no active plan. The same lifecycle boundary
+    _compute_plan_status()'s closest-approach calc and index.html's
+    getVisiblePoints() already use to keep a reused device's prior
+    assignment's track out of the new plan — distance/movement tools below
+    need the identical clamp, confirmed missing from both after a real,
+    reported case: asked for a device's "latest update," Goby reported
+    distance traveled over the full requested window even though the device
+    had an active plan that started partway through it, double-counting
+    travel from before the current plan began. Returned as a raw string
+    (not parsed into a datetime) so it can be compared directly against
+    obs_time/other YYYY-MM-DD[ HH:MM:SS] strings — same string-comparison
+    approach _compute_plan_status() already relies on, since this format
+    sorts correctly as plain text."""
+    with sqlite3.connect(DB_PATH) as con:
+        row = con.execute("SELECT start_date FROM device_plans WHERE uuid = ?", (uuid,)).fetchone()
+    return row[0] if row and row[0] else None
+
+
 def _device_recent_distance(uuid: str, days: int | None = 30):
     """Total distance traveled in the last `days` days — cheap (one bounded
     query, same 30-day default as the dashboard's own track window) and
@@ -1799,10 +1840,27 @@ def _device_recent_distance(uuid: str, days: int | None = 30):
     structural, not a stronger prompt instruction: give every device a real
     number to draw from for exactly this question shape, since an explicit
     "never invent statistics" instruction alone isn't reliable enough against
-    a small model when the alternative is an empty field."""
+    a small model when the alternative is an empty field.
+
+    If the device has an active Smart Tracking plan whose start_date is
+    LATER than the requested window's own start, the plan's start_date wins —
+    see _plan_start_date(). Returns (distance_miles, clamped_to) where
+    clamped_to is the plan's start_date string when the clamp actually
+    narrowed the window, else None (no plan, or the plan started before the
+    requested window anyway, in which case there's nothing to call out)."""
+    plan_start = _plan_start_date(uuid)
+    days_cutoff = None
+    if days is not None:
+        days_cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+    clamped_to = plan_start if (plan_start and (days_cutoff is None or plan_start > days_cutoff[:10])) else None
     with sqlite3.connect(DB_PATH) as con:
         con.row_factory = sqlite3.Row
-        if days is not None:
+        if clamped_to:
+            pts = con.execute(
+                "SELECT lat, lon FROM observations WHERE uuid = ? AND obs_time >= ? ORDER BY obs_time",
+                (uuid, clamped_to),
+            ).fetchall()
+        elif days is not None:
             pts = con.execute(
                 "SELECT lat, lon FROM observations WHERE uuid = ? AND obs_time >= datetime('now', ?) ORDER BY obs_time",
                 (uuid, f"-{days} days"),
@@ -1812,10 +1870,10 @@ def _device_recent_distance(uuid: str, days: int | None = 30):
                 "SELECT lat, lon FROM observations WHERE uuid = ? ORDER BY obs_time", (uuid,)
             ).fetchall()
     if len(pts) < 2:
-        return None
+        return None, clamped_to
     total = sum(_haversine_meters(pts[i - 1]["lat"], pts[i - 1]["lon"], pts[i]["lat"], pts[i]["lon"])
                 for i in range(1, len(pts)))
-    return round(total / _METERS_PER_MILE, 2)
+    return round(total / _METERS_PER_MILE, 2), clamped_to
 
 
 def _device_signal_quality(uuid: str) -> dict:
@@ -1916,8 +1974,16 @@ def _device_insight(uuid: str, deep: bool = False, date_range=None) -> dict:
     """Computed facts about one visible device — the cadence baseline (see
     _device_cadence()) plus, when deep=True, a movement/dwell summary over
     `date_range` (start, end) if given, else all available history. Caller
-    must have already confirmed the device is visible to this session."""
+    must have already confirmed the device is visible to this session.
+
+    Same plan-start clamp as _device_recent_distance() (see
+    _plan_start_date()) — this was the OTHER confirmed gap from the same
+    report: compute_distance's "all available history" default was an even
+    bigger version of the bug, since with no date named at all it would
+    count a reused device's ENTIRE prior assignment's travel, not just a
+    30-day slice of it."""
     insight = _device_cadence(uuid)
+    plan_start = _plan_start_date(uuid)
     with sqlite3.connect(DB_PATH) as con:
         con.row_factory = sqlite3.Row
         labels = con.execute(
@@ -1928,11 +1994,34 @@ def _device_insight(uuid: str, deep: bool = False, date_range=None) -> dict:
         if deep:
             if date_range:
                 start, end, label = date_range
+                plan_start_dt = datetime.strptime(plan_start, "%Y-%m-%d") if plan_start else None
+                # Only clamp when the requested window actually extends INTO
+                # the plan (plan_start falls strictly within [start, end)) —
+                # if the whole window predates the plan, the user explicitly
+                # named a historical range and is asking a real "what
+                # happened back then" question, not a "since the current
+                # plan" one; clamping start past end here would silently
+                # invert the range into an empty result instead of
+                # answering the real question. Compared as real datetimes,
+                # not string prefixes — `end` is an EXCLUSIVE boundary (the
+                # day AFTER the actually-requested last day, see
+                # _tool_compute_distance), so slicing its date string would
+                # wrongly count a plan starting exactly the day after the
+                # requested range as "within" it.
+                if plan_start_dt and start < plan_start_dt < end:
+                    start = plan_start_dt
+                    label += f" (clamped to plan start {plan_start} — the plan began partway through the requested window)"
                 pts = con.execute(
                     "SELECT lat, lon, obs_time FROM observations WHERE uuid = ? AND obs_time BETWEEN ? AND ? ORDER BY obs_time",
                     (uuid, start.strftime("%Y-%m-%d %H:%M:%S"), end.strftime("%Y-%m-%d %H:%M:%S")),
                 ).fetchall()
                 insight["movement_window"] = label
+            elif plan_start:
+                pts = con.execute(
+                    "SELECT lat, lon, obs_time FROM observations WHERE uuid = ? AND obs_time >= ? ORDER BY obs_time",
+                    (uuid, plan_start),
+                ).fetchall()
+                insight["movement_window"] = f"since plan start {plan_start} (no date named, and device has an active plan — not all-time)"
             else:
                 pts = con.execute(
                     "SELECT lat, lon, obs_time FROM observations WHERE uuid = ? ORDER BY obs_time",
@@ -2014,10 +2103,11 @@ def _fleet_digest(days: int | None = 30) -> dict:
     summary = []
     for d in devices:
         by_group[d["group_name"]] = by_group.get(d["group_name"], 0) + 1
+        distance_miles, clamped_to = _device_recent_distance(d["uuid"], days=days)
         entry = {
             "name": d["name"], "uuid": d["uuid"], "group": d["group_name"],
             "fix_count": d["fix_count"], "last_seen": d["last_seen"],
-            "distance_miles": _device_recent_distance(d["uuid"], days=days),
+            "distance_miles": distance_miles,
             **_device_cadence(d["uuid"]),
             **_device_signal_quality(d["uuid"]),
             # Already computed by _visible_devices() itself — zero extra
@@ -2026,6 +2116,12 @@ def _fleet_digest(days: int | None = 30) -> dict:
             # detail behind a non-null value.
             "plan_status": d["plan_status"],
         }
+        # Per-device override of the fleet-wide distance_window below — set
+        # only when this device's plan start_date actually narrowed its own
+        # distance_miles below the requested window, so the model doesn't
+        # misreport a clamped number under the broader fleet label.
+        if clamped_to:
+            entry["distance_window"] = f"since plan start {clamped_to} (narrower than the requested window below)"
         near = _nearest_place(d["lat"], d["lon"])
         if near:
             entry["near"] = near
@@ -2036,12 +2132,26 @@ def _fleet_digest(days: int | None = 30) -> dict:
     # single total that didn't match the sum of the very numbers it was given).
     total_distance = sum(e["distance_miles"] or 0 for e in summary)
     window_label = f"last {days} days" if days is not None else "all-time"
-    return {
+    shown = summary[:50]
+    result = {
         "device_count": len(devices), "devices_by_group": by_group,
         "distance_window": window_label,
         "fleet_total_distance_miles": round(total_distance, 2),
-        "devices": summary[:50],
+        "devices": shown,
     }
+    # Previously silent: device_count/fleet_total_distance_miles already
+    # reflect every visible device, but "devices" itself was truncated with
+    # zero signal — a fleet with >50 visible devices would answer "list all
+    # devices" (or "which traveled farthest") from only the first 50 by
+    # last_seen, possibly missing the actual answer, with nothing telling
+    # the model its view was incomplete.
+    if len(shown) < len(devices):
+        result["note"] = (
+            f"Only the {len(shown)} most recently-seen of {len(devices)} total visible devices "
+            f"are listed below — device_count and fleet_total_distance_miles above still reflect "
+            f"ALL {len(devices)}. Say so if asked to list/compare every device."
+        )
+    return result
 
 
 def _mentioned_device(messages: list[dict], visible_devices: list[dict]):
@@ -2211,13 +2321,10 @@ def _tool_compute_distance(args: dict) -> dict:
             return {"error": "start_date/end_date must be in YYYY-MM-DD format"}
         date_range = (start, end, f"{start_date or 'the beginning'} to {end_date or 'now'}")
     insight = _device_insight(d["uuid"], deep=True, date_range=date_range)
-    # Never send raw coordinates to the model — first/last position keep only
-    # the timestamp and the resolved place-name approximation. Exact
-    # coordinates are handled entirely outside the model — see
+    # No stripping needed here — _position_snapshot() (what first_position/
+    # last_position already are) never includes raw lat/lon in the first
+    # place. Exact coordinates are handled entirely outside the model — see
     # _try_exact_location_shortcut().
-    for key in ("first_position", "last_position"):
-        if isinstance(insight.get(key), dict):
-            insight[key] = {"obs_time": insight[key].get("obs_time"), "near": insight[key].get("near")}
     return {"name": d["name"], "uuid": d["uuid"], **insight}
 
 
@@ -2359,6 +2466,15 @@ def _tool_get_audit_log(args: dict) -> dict:
         params.append(action_filter)
     start_date, end_date = args.get("start_date"), args.get("end_date")
     if start_date:
+        # Validated the same way end_date already is below — previously
+        # unvalidated, so a malformed date from the model (e.g. not
+        # YYYY-MM-DD) would silently become a nonsensical string comparison
+        # against `ts` instead of a clear error, returning wrong/empty rows
+        # with no sign anything was off.
+        try:
+            datetime.strptime(start_date, "%Y-%m-%d")
+        except ValueError:
+            return {"error": "start_date must be in YYYY-MM-DD format"}
         query += " AND ts >= ?"
         params.append(start_date)
     if end_date:
@@ -2422,7 +2538,7 @@ _AI_TOOL_DISPATCH = {
 _AI_TOOLS = [
     {"type": "function", "function": {
         "name": "list_devices",
-        "description": "List every device visible to the current user, with group, fix count, last-seen time, approximate location, cadence/staleness, average confidence/accuracy, distance traveled over a given window (plus a combined fleet total), and plan_status ('on_track'/'overdue'/'moving_away', or null if the device has no Smart Tracking plan). plan_status alone is already enough for 'which devices are overdue/on track/moving away' — only call get_plan_status for a device's actual destination/ETA detail.",
+        "description": "List every device visible to the current user, with group, fix count, last-seen time, approximate location, cadence/staleness, average confidence/accuracy, distance traveled over a given window (plus a combined fleet total), and plan_status ('on_track'/'overdue'/'moving_away', or null if the device has no Smart Tracking plan). plan_status alone is already enough for 'which devices are overdue/on track/moving away' — only call get_plan_status for a device's actual destination/ETA detail. A device with an active plan never counts distance from before that plan's start_date, even if the requested window reaches further back — when this clamp actually narrows a device's own window below the one you asked for, that device's entry carries its OWN 'distance_window' field overriding the top-level one; state that device's distance using its own distance_window, not the fleet-wide one.",
         "parameters": {"type": "object", "properties": {
             "days": {"type": "integer", "description": "How many days back to compute distance traveled over. Default 30 if omitted. Pass 0 for all-time."},
         }},
@@ -2436,7 +2552,7 @@ _AI_TOOLS = [
     }},
     {"type": "function", "function": {
         "name": "compute_distance",
-        "description": "Distance traveled, movement pattern, and dwell/stop time for one device, optionally within a date range.",
+        "description": "Distance traveled, movement pattern, and dwell/stop time for one device, optionally within a date range. If the device has an active Smart Tracking plan, distance never counts from before that plan's start_date, even if start_date/'all-time' would otherwise reach further back — the response's movement_window field states the actual window used (it says so explicitly when the plan start clamped it), state that window rather than assuming the one requested.",
         "parameters": {"type": "object", "properties": {
             "device": {"type": "string", "description": "Device name or UUID"},
             "start_date": {"type": "string", "description": "ISO 8601 date, e.g. 2026-09-01. Omit for all-time."},
@@ -2457,7 +2573,7 @@ _AI_TOOLS = [
         "parameters": {"type": "object", "properties": {
             "limit": {"type": "integer", "description": "Max rows to return, default 50, capped at 500"},
             "username": {"type": "string", "description": "Optional — a person's display name or username to filter to, e.g. 'Tho Pham' or 'tpham'"},
-            "action": {"type": "string", "description": "Optional — exact action type to filter to. Use 'login' for login-history questions. Other values seen in this system: logout, login_failed, password_change, user.create, user.update, user.password_reset, group.update, device.archive, device.delete, device.access_update, label.create, label.update, label.delete, ai.ask, ai.tool_call, ai.enabled_toggle, ai.history_clear."},
+            "action": {"type": "string", "description": "Optional — exact action type to filter to. Use 'login' for login-history questions. Every other real value this system logs: logout, login_failed, password_change, user.create, user.update, user.password_reset, user.delete, group.create, group.update, group.delete, group_code.create, group_code.delete, device.archive, device.unarchive, device.access_update, device.export, device.backup, device.delete, plan.create, plan.update, plan.delete, label.create, label.update, label.delete, ai.ask, ai.tool_call, ai.enabled_toggle, ai.history_clear, schema_version.change, app_version.change."},
             "start_date": {"type": "string", "description": "Optional — YYYY-MM-DD, inclusive start of the date range"},
             "end_date": {"type": "string", "description": "Optional — YYYY-MM-DD, inclusive end of the date range"},
         }},
@@ -2628,10 +2744,19 @@ def ai_history():
     limit = min(int(request.args.get("limit", 50)), 100)
     with sqlite3.connect(DB_PATH) as con:
         con.row_factory = sqlite3.Row
-        rows = con.execute(
-            "SELECT role, content, created_at FROM ai_messages WHERE user_id = ? ORDER BY created_at ASC LIMIT ?",
-            (session["user_id"], limit),
-        ).fetchall()
+        # ORDER BY ... ASC LIMIT N (the previous version of this query) grabs
+        # the OLDEST N rows, not the most recent N — confirmed real for any
+        # user with more than `limit` total turns: reopening the panel would
+        # show their very first conversations ever instead of recent ones.
+        # Fixed with the standard "most recent N, re-sorted oldest-first for
+        # display" pattern — take the latest N by DESC+LIMIT in a subquery,
+        # then re-sort that smaller set ASC for chronological display order.
+        rows = con.execute("""
+            SELECT role, content, created_at FROM (
+                SELECT role, content, created_at FROM ai_messages
+                WHERE user_id = ? ORDER BY created_at DESC LIMIT ?
+            ) ORDER BY created_at ASC
+        """, (session["user_id"], limit)).fetchall()
     return jsonify([dict(r) for r in rows])
 
 
