@@ -381,7 +381,21 @@ def _visible_devices(want_archived: bool = False) -> list[dict]:
     # every call.
     for d in devices:
         plan = plans.get(d["uuid"])
-        d["plan_status"] = _compute_plan_status(d["uuid"], plan, d["lat"], d["lon"])["status"] if plan else None
+        if plan:
+            d["plan_status"] = _compute_plan_status(d["uuid"], plan, d["lat"], d["lon"])["status"]
+            # fix_count defaults to all-time (the cnt join above) — for a
+            # device with an active plan, override it to only count fixes
+            # since the plan's own start_date, same clamp reasoning as the
+            # distance-traveled tools: a reused device's fix count shouldn't
+            # include activity from before its current plan began.
+            with sqlite3.connect(DB_PATH) as con:
+                d["fix_count"] = con.execute(
+                    "SELECT COUNT(*) FROM observations WHERE uuid = ? AND obs_time >= ?",
+                    (d["uuid"], plan["start_date"]),
+                ).fetchone()[0]
+            d["fix_count_window"] = f"since plan start {plan['start_date']}"
+        else:
+            d["plan_status"] = None
     return devices
 
 
@@ -2122,6 +2136,8 @@ def _fleet_digest(days: int | None = 30) -> dict:
         # misreport a clamped number under the broader fleet label.
         if clamped_to:
             entry["distance_window"] = f"since plan start {clamped_to} (narrower than the requested window below)"
+        if d.get("fix_count_window"):
+            entry["fix_count_window"] = d["fix_count_window"]
         near = _nearest_place(d["lat"], d["lon"])
         if near:
             entry["near"] = near
@@ -2298,6 +2314,8 @@ def _tool_get_device_status(args: dict) -> dict:
               **_device_cadence(d["uuid"]), **_device_signal_quality(d["uuid"])}
     if near:
         result["near"] = near
+    if d.get("fix_count_window"):
+        result["fix_count_window"] = d["fix_count_window"]
     # Scoped to one device, so (unlike list_devices' fleet-wide digest) the
     # full plan detail is cheap enough to include directly rather than
     # making the model issue a separate get_plan_status call for something
@@ -2538,14 +2556,14 @@ _AI_TOOL_DISPATCH = {
 _AI_TOOLS = [
     {"type": "function", "function": {
         "name": "list_devices",
-        "description": "List every device visible to the current user, with group, fix count, last-seen time, approximate location, cadence/staleness, average confidence/accuracy, distance traveled over a given window (plus a combined fleet total), and plan_status ('on_track'/'overdue'/'moving_away', or null if the device has no Smart Tracking plan). plan_status alone is already enough for 'which devices are overdue/on track/moving away' — only call get_plan_status for a device's actual destination/ETA detail. A device with an active plan never counts distance from before that plan's start_date, even if the requested window reaches further back — when this clamp actually narrows a device's own window below the one you asked for, that device's entry carries its OWN 'distance_window' field overriding the top-level one; state that device's distance using its own distance_window, not the fleet-wide one.",
+        "description": "List every device visible to the current user, with group, fix count, last-seen time, approximate location, cadence/staleness, average confidence/accuracy, distance traveled over a given window (plus a combined fleet total), and plan_status ('on_track'/'overdue'/'moving_away', or null if the device has no Smart Tracking plan). plan_status alone is already enough for 'which devices are overdue/on track/moving away' — only call get_plan_status for a device's actual destination/ETA detail. A device with an active plan never counts distance OR fix_count from before that plan's start_date, even if the requested window reaches further back — when this clamp actually narrows a device's own window below the one you asked for, that device's entry carries its own 'distance_window' and/or 'fix_count_window' field overriding the defaults; state that device's distance/fix count using its own window field, not the fleet-wide one.",
         "parameters": {"type": "object", "properties": {
             "days": {"type": "integer", "description": "How many days back to compute distance traveled over. Default 30 if omitted. Pass 0 for all-time."},
         }},
     }},
     {"type": "function", "function": {
         "name": "get_device_status",
-        "description": "Cadence/staleness, average confidence/accuracy, approximate current location, and full Smart Tracking plan detail (destination, ETA, computed status) for one specific device — already includes everything get_plan_status would return for this device, under the 'plan' field (plan.has_plan is false if none exists), so there's no need to call get_plan_status separately after this for the same device.",
+        "description": "Fix count, cadence/staleness, average confidence/accuracy, approximate current location, and full Smart Tracking plan detail (destination, ETA, computed status) for one specific device — already includes everything get_plan_status would return for this device, under the 'plan' field (plan.has_plan is false if none exists), so there's no need to call get_plan_status separately after this for the same device. A device with an active plan never counts fix_count from before that plan's start_date — when that clamp applies, a 'fix_count_window' field states it explicitly.",
         "parameters": {"type": "object", "properties": {
             "device": {"type": "string", "description": "Device name or UUID"},
         }, "required": ["device"]},

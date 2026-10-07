@@ -990,7 +990,7 @@ async function renderArchived() {
       </div>
       <div class="card-uuid">${d.uuid}</div>
       <div class="card-stats">
-        <span><span class="stat-val">${d.fix_count}</span> fixes</span>
+        <span title="${d.fix_count_window || 'all-time'}"><span class="stat-val">${d.fix_count}</span> fixes</span>
         <span><span class="stat-val">${ago(d.last_seen)}</span></span>
       </div>
       <div class="card-lastseen">${d.last_seen || '—'}</div>
@@ -1181,7 +1181,7 @@ function deviceCardHtml(d) {
     </div>
     <div class="card-uuid">${d.uuid}</div>
     <div class="card-stats">
-      <span><span class="stat-val">${d.fix_count}</span> fixes</span>
+      <span title="${d.fix_count_window || 'all-time'}"><span class="stat-val">${d.fix_count}</span> fixes</span>
       <span>±<span class="stat-val">${d.accuracy}</span>m</span>
       <span>conf <span class="stat-val">${d.confidence}</span></span>
       <span><span class="stat-val">${ago(d.last_seen)}</span></span>
