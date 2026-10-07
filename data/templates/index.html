@@ -262,6 +262,11 @@ html, body { height: 100%; font-family: 'Segoe UI', sans-serif; background: #0d1
   text-decoration: none; color: #333;
 }
 .leaflet-control-resetview a:hover { background: #f4f4f4; }
+.leaflet-control-boxzoomhint {
+  display: flex; align-items: center; justify-content: center;
+  width: 30px; height: 30px; background: #fff; border-radius: 4px;
+  color: #333; cursor: default;
+}
 .leaflet-popup-content-wrapper {
   background: #161b22; color: #c9d1d9;
   border: 1px solid #30363d; border-radius: 8px; box-shadow: 0 4px 16px rgba(0,0,0,.5);
@@ -625,7 +630,14 @@ L.Icon.Default.mergeOptions({
 });
 
 // ── Map ───────────────────────────────────────────────────────────
-const map = L.map('map').setView([33.30, 44.39], 14);
+// boxZoom is on by default in Leaflet — named explicitly here since it's
+// otherwise easy to assume this map has it disabled, the way dragging-based
+// box zoom is sometimes turned off in map UIs with their own pan/select
+// mode toggle. Shift+drag draws a selection box and zooms to it on release.
+// Neutral world view — real content always replaces this immediately via
+// resetView()'s fitBounds() once any device data loads, so this is only
+// ever actually seen as the empty-state fallback (zero visible devices).
+const map = L.map('map', { boxZoom: true }).setView([0, 0], 2);
 
 // Factored out so the Smart Tracking plan-picker mini-map (a second,
 // independent Leaflet instance inside a modal) gets the same dev/prod
@@ -676,6 +688,22 @@ L.Control.ResetView = L.Control.extend({
   }
 });
 new L.Control.ResetView().addTo(map);
+
+// Pure hint, non-interactive — box zoom (Shift+drag) is a native Leaflet
+// feature with no on-screen trace otherwise, so nothing would tell a user
+// it exists.
+L.Control.BoxZoomHint = L.Control.extend({
+  options: { position: 'topleft' },
+  onAdd() {
+    const div = L.DomUtil.create('div', 'leaflet-bar leaflet-control-boxzoomhint');
+    div.title = 'Shift + drag on the map to zoom into an area';
+    div.innerHTML = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="4" y="4" width="16" height="16" rx="1" stroke-dasharray="3 2"/>
+    </svg>`;
+    return div;
+  }
+});
+new L.Control.BoxZoomHint().addTo(map);
 
 // ── State ─────────────────────────────────────────────────────────
 // Devices are colored by group, not individually. An admin can set an
@@ -1646,7 +1674,7 @@ async function drawPlanOverlay(uuid) {
 function resetView() {
   const latlngs = Object.values(layers).map(l => l.marker.getLatLng());
   if (latlngs.length) map.fitBounds(L.latLngBounds(latlngs).pad(0.2));
-  else map.setView([33.30, 44.39], 14);
+  else map.setView([0, 0], 2);
 }
 
 // Called after a filter toggle turns one or more specific devices ON, with
