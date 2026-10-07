@@ -285,6 +285,12 @@ html, body { height: 100%; font-family: 'Segoe UI', sans-serif; background: #0d1
   50%      { opacity: 0.4; transform: scale(1.6); box-shadow: 0 0 10px 4px var(--c); }
 }
 .crumb-latest { animation: pulse 0.8s ease-in-out infinite; border-radius: 50%; }
+/* Overview-only latest-position marker: smaller and a slower pulse than the
+   drilled-in/highlight uses of .crumb-latest above — a map full of markers
+   flashing in sync at 0.8s was busier than an overview glance needs; higher
+   specificity (two classes) wins over .crumb-latest's animation shorthand
+   regardless of source order, so only the duration changes here. */
+.crumb-latest-overview { animation-duration: 1.8s; }
 
 /* ── Modal (replaces native prompt()/confirm()) ─────────────────── */
 .modal-backdrop {
@@ -995,10 +1001,13 @@ function selectLogRow(idx) {
 }
 
 // ── Map rendering ─────────────────────────────────────────────────
-function markerIcon(color) {
+function markerIcon(color, overview) {
+  const size = overview ? 13 : 20;
+  const border = overview ? 2 : 3;
+  const cls = overview ? 'crumb-latest crumb-latest-overview' : 'crumb-latest';
   return L.divIcon({
-    html: `<div class="crumb-latest" style="width:20px;height:20px;background:${color};border:3px solid #fff;--c:${color}"></div>`,
-    className: '', iconSize: [20,20], iconAnchor: [10,10]
+    html: `<div class="${cls}" style="width:${size}px;height:${size}px;background:${color};border:${border}px solid #fff;--c:${color}"></div>`,
+    className: '', iconSize: [size,size], iconAnchor: [size/2,size/2]
   });
 }
 
@@ -1049,7 +1058,12 @@ function renderTracks(tracks) {
 
     const color  = getColor(track);
     const latest = points[points.length - 1];   // true latest fix — unaffected by the time window
-    const marker = L.marker([latest.lat, latest.lon], { icon: markerIcon(color) })
+    // Smaller/slower-pulsing icon, and recolored to the device's plan-status
+    // chip color when it isn't on_track, only applies in overview — the
+    // drilled-in view already shows the same signal via the detail panel's
+    // own chip, so its single latest marker keeps the original look.
+    const markerColor = selectedDevice ? color : overviewMarkerColor(uuid, color);
+    const marker = L.marker([latest.lat, latest.lon], { icon: markerIcon(markerColor, !selectedDevice) })
       .addTo(map)
       .bindPopup(popupHtml(name, uuid, latest), { offset: [0, -14], maxWidth: 260 })
       .bindTooltip(`${name} — ${latest.timestamp || '—'}`, { direction: 'top', offset: [0, -14], className: 'crumb-tip' })
@@ -1092,6 +1106,19 @@ const PLAN_STATUS_LABELS = { on_track: 'On track', overdue: '⚠ Overdue', movin
 function planStatusChipHtml(status) {
   if (!status || !PLAN_STATUS_LABELS[status]) return '';
   return `<span class="plan-chip ${status}" title="Smart Tracking plan status">${PLAN_STATUS_LABELS[status]}</span>`;
+}
+
+// Same colors as .plan-chip above (on_track omitted deliberately — a device
+// on track keeps its normal group color on the overview marker; only a
+// device that needs attention gets recolored to match its card's chip).
+const PLAN_STATUS_MARKER_COLORS = { overdue: '#f85149', moving_away: '#e3b341' };
+// cachedDevices (not allTracks — /api/tracks carries no plan_status) is the
+// only place plan_status lives client-side; looked up per marker rather than
+// stapled onto allTracks so there's one source of truth for it, same as the
+// card chip reads straight from the /api/devices response.
+function overviewMarkerColor(uuid, fallbackColor) {
+  const d = cachedDevices.find(d => d.uuid === uuid);
+  return (d && PLAN_STATUS_MARKER_COLORS[d.plan_status]) || fallbackColor;
 }
 
 function deviceCardHtml(d) {
@@ -1775,6 +1802,10 @@ async function loadAll() {
   currentUser = me;
   syncUserUI();
   allTracks = tracks;
+  // cachedDevices (read by renderTracks()'s overview marker coloring) has to
+  // be set before that first renderTracks() call below, not after — renderPanel()
+  // sets it too, but that would be one render too late for the very first paint.
+  cachedDevices = devices;
   renderTracks(allTracks);
   renderPanel(devices);
   resetView();
@@ -1813,12 +1844,25 @@ function connectSSE() {
         track.points.sort((a,b) => (a.timestamp??'') < (b.timestamp??'') ? -1 : 1);
       }
     }
-    renderTracks(allTracks);
-    apiFetch('/api/devices').then(r => r.json()).then(renderPanel);
+    // Fetch devices (for plan_status, group colors, etc.) BEFORE redrawing
+    // tracks, same reasoning as loadAll() — otherwise this new fix's marker
+    // just reused the previous, possibly-stale cachedDevices snapshot.
+    apiFetch('/api/devices').then(r => r.json()).then(devices => {
+      cachedDevices = devices;
+      renderTracks(allTracks);
+      renderPanel(devices);
+    });
   };
 }
 
-setInterval(() => apiFetch('/api/devices').then(r => r.json()).then(renderPanel), 30000);
+// Plan status (overdue/moving_away) can change from time alone, with no new
+// fix arriving to trigger the SSE path above — re-running renderTracks() here
+// too keeps the overview marker color from going stale between real updates.
+setInterval(() => apiFetch('/api/devices').then(r => r.json()).then(devices => {
+  cachedDevices = devices;
+  renderTracks(allTracks);
+  renderPanel(devices);
+}), 30000);
 loadAll().then(connectSSE);
 
 {% if ai_enabled %}
