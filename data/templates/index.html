@@ -306,6 +306,11 @@ html, body { height: 100%; font-family: 'Segoe UI', sans-serif; background: #0d1
   width: 400px; max-width: 90vw; background: #161b22; border: 1px solid #30363d;
   border-radius: 8px; padding: 20px; box-shadow: 0 8px 30px rgba(0,0,0,.5);
 }
+/* Opt-in wider variant for content that doesn't fit the default 400px (e.g.
+   the Ask Goby guide's tables) — a separate class rather than widening the
+   shared default, since every other modal's content (forms, confirmations)
+   is sized correctly for 400px already. */
+.modal.wide { width: 820px; }
 .modal-header { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 14px; }
 .modal-title { font-size: .92rem; font-weight: 600; color: #58a6ff; }
 .modal-close-x {
@@ -313,7 +318,24 @@ html, body { height: 100%; font-family: 'Segoe UI', sans-serif; background: #0d1
   color: #8b949e; font-size: 1rem; line-height: 1; cursor: pointer; border-radius: 4px;
 }
 .modal-close-x:hover { color: #c9d1d9; background: #21262d; }
-.modal-body { font-size: .82rem; color: #c9d1d9; margin-bottom: 18px; }
+/* max-height+scroll was never needed before — every existing modal's
+   content fits comfortably — but is harmless for short content and a
+   real requirement for the guide's long tables/examples. */
+.modal-body { font-size: .82rem; color: #c9d1d9; margin-bottom: 18px; max-height: 70vh; overflow-y: auto; }
+.modal.wide .modal-body { max-height: 80vh; }
+.guide-table { width: 100%; border-collapse: collapse; margin: 8px 0 16px; font-size: .85rem; }
+.guide-table th, .guide-table td { border: 1px solid #30363d; padding: 6px 9px; text-align: left; vertical-align: top; }
+.guide-table th { background: #0d1117; font-weight: 600; }
+/* Was plain dim #8b949e text at .78rem — confirmed hard to read against the
+   dark modal background. Now a bordered callout at the same brightness/size
+   as the rest of the modal body, not a dimmer secondary tone. */
+.guide-hint {
+  color: #c9d1d9; font-size: .85rem; margin: 0 0 14px;
+  background: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 10px 14px;
+}
+.guide-hint ul { margin: 4px 0 0 18px; padding: 0; }
+.guide-more summary { cursor: pointer; color: #58a6ff; font-size: .82rem; font-weight: 600; margin: 6px 0; }
+.guide-more[open] summary { margin-bottom: 10px; }
 .modal-body label { display: block; font-size: .72rem; color: #8b949e; margin: 12px 0 4px; }
 .modal-body label:first-child { margin-top: 0; }
 .modal-body input[type="password"], .modal-body input[type="text"] {
@@ -551,6 +573,7 @@ html, body { height: 100%; font-family: 'Segoe UI', sans-serif; background: #0d1
     <div id="ai-panel-header">
       <span id="ai-panel-title">🐟 Ask Goby</span>
       <div id="ai-panel-header-actions">
+        <button class="modal-close-x" onclick="openAiGuide()" aria-label="Guide" title="Guide — what Goby can answer">?</button>
         <button class="modal-close-x" onclick="clearAiHistory()" aria-label="Clear chat history" title="Clear chat history">🗑</button>
         <button class="modal-close-x" onclick="toggleAiPanel()" aria-label="Close" title="Close">✕</button>
       </div>
@@ -1694,9 +1717,10 @@ function ensureVisible(uuids) {
 // ── Modal (replaces native prompt()/confirm()) ─────────────────────
 // onConfirm may return `false` to keep the modal open (e.g. validation
 // failed) — anything else closes it.
-function openModal(title, bodyHtml, { confirmLabel = 'Save', danger = false, onConfirm }) {
+function openModal(title, bodyHtml, { confirmLabel = 'Save', danger = false, onConfirm, wide = false }) {
   document.getElementById('modal-title').textContent = title;
   document.getElementById('modal-body').innerHTML = bodyHtml;
+  document.querySelector('#modal-backdrop .modal').classList.toggle('wide', wide);
   const btn = document.getElementById('modal-confirm-btn');
   btn.textContent = confirmLabel;
   btn.className = 'btn ' + (danger ? 'danger' : 'primary');
@@ -1990,6 +2014,82 @@ async function loadAiHistory() {
     aiMessages = rows.map(r => ({ role: r.role, content: r.content }));
     renderAiMessages();
   } catch (e) {}
+}
+
+// Static reference content — no backend route, no fetch. Placeholders
+// (<device>/<group>/<place>) are deliberate: real device names are
+// dev-environment-specific and would be meaningless (or wrong) once this
+// runs against prod's actual fleet, so nothing here names a real device.
+function openAiGuide() {
+  openModal('🐟 Ask Goby Guide', `
+    <p>Ask Goby answers questions about your tracking data by calling real tools
+    that query the live database — it never invents numbers, positions, or
+    statuses, and it only ever sees what <strong>you</strong> can already see
+    on the dashboard. Nothing more.</p>
+    <div class="guide-hint">A few things worth knowing up front:
+      <ul>
+        <li>Country/place-proximity answers are approximations based on the nearest known city, not real border lines.</li>
+        <li>Exact GPS coordinates are only given when you explicitly ask for them — never slipped into a general answer.</li>
+        <li>Archived devices are invisible to Goby entirely, even one with an active plan.</li>
+        <li>If you ask about a device or group you don't have access to, Goby will say so plainly rather than guessing or showing it anyway.</li>
+      </ul>
+    </div>
+    <div class="guide-hint">Tips:
+      <ul>
+        <li>You can ask follow-ups — "what about the other one" after naming a device works, Goby remembers the conversation.</li>
+        <li>Dates can be phrased loosely ("last 2 weeks," "this month") — exact YYYY-MM-DD isn't required.</li>
+        <li>A device can be named by its display name <em>or</em> its UUID; group names aren't case-sensitive.</li>
+      </ul>
+    </div>
+    <p class="guide-hint"><em>Examples below use &lt;device&gt;/&lt;group&gt;/&lt;place&gt; as placeholders — swap in any real one you can see.</em></p>
+
+    <h4 style="margin:14px 0 4px;color:#c9d1d9;">Fleet-wide (across everything you can see)</h4>
+    <table class="guide-table">
+      <tr><th>Tool</th><th>What it tells you</th><th>Try asking</th></tr>
+      <tr><td>List devices</td><td>A full overview — group, activity, signal quality, speed, distance traveled, and plan status for every device at once</td><td>"List every device I can see."</td></tr>
+      <tr><td>Plan alerts</td><td>Just the devices that need attention right now (overdue or drifting from their destination)</td><td>"Which devices need attention right now?"</td></tr>
+      <tr><td>Group devices</td><td>Everything in one named group</td><td>"How many devices are in &lt;group&gt;?"</td></tr>
+      <tr><td>Find devices near a place</td><td>Which devices are near a city, or how far one is from it</td><td>"Which devices are near &lt;place&gt;?"</td></tr>
+      <tr><td>Search labels</td><td>Search the notes people have added to devices</td><td>"What label is on &lt;device&gt;?"</td></tr>
+    </table>
+
+    <h4 style="margin:14px 0 4px;color:#c9d1d9;">One device at a time</h4>
+    <table class="guide-table">
+      <tr><th>Tool</th><th>What it tells you</th><th>Try asking</th></tr>
+      <tr><td>Device status</td><td>The full picture for one device — activity, signal quality, speed, location, current plan</td><td>"Give me a status update on &lt;device&gt;."</td></tr>
+      <tr><td>Compute distance</td><td>How far it traveled, how fast, and where it stopped, over any date range</td><td>"How far did &lt;device&gt; travel last week?"</td></tr>
+      <tr><td>Reporting gaps</td><td>Its biggest stretches of silence, historically</td><td>"What's &lt;device&gt;'s longest reporting gap?"</td></tr>
+      <tr><td>Plan status</td><td>Its current destination, ETA, and whether it's on track</td><td>"Is &lt;device&gt; on track?"</td></tr>
+      <tr><td>Plan history</td><td>Its past plans — including whether each one was completed or cancelled</td><td>"Show me &lt;device&gt;'s plan history."</td></tr>
+      <tr><td>Country history</td><td>Which countries it's been in over time</td><td>"Has &lt;device&gt; left the country recently?"</td></tr>
+    </table>
+
+    <h4 style="margin:14px 0 4px;color:#c9d1d9;">Admin only</h4>
+    <table class="guide-table">
+      <tr><th>Tool</th><th>What it tells you</th><th>Try asking</th></tr>
+      <tr><td>Audit log</td><td>Logins and admin activity</td><td>"Who logged in last week?"</td></tr>
+    </table>
+    <p class="guide-hint">Two separate gates apply here, not one: you need to be an admin, <strong>and</strong> the super admin needs to have specifically granted you audit log access — being an admin alone isn't enough.</p>
+
+    <details class="guide-more">
+      <summary>More example questions</summary>
+      <p class="guide-hint"><strong>A graceful "no access" example</strong> — Goby won't fabricate an answer for something outside your visibility:</p>
+      <p class="guide-hint">"Where is &lt;a device outside your group&gt;?" → <em>"I don't have access to that device."</em></p>
+      <div class="guide-hint" style="margin-top:12px;"><strong>Questions that combine more than one tool, or need real reasoning:</strong>
+        <ul>
+          <li>"Compare &lt;device A&gt; and &lt;device B&gt;'s signal quality over the last month — which one is degrading?" <em>(Device status, called twice)</em></li>
+          <li>"Which devices in &lt;group&gt; are currently within 50 miles of &lt;place&gt;?" <em>(Group devices + Find devices near a place)</em></li>
+          <li>"What was &lt;device&gt;'s longest stop in the last 30 days, and where was it?" <em>(Compute distance)</em></li>
+          <li>"&lt;device&gt; has an active plan — how far has it traveled since the plan started, not counting before?" <em>(Plan status + Compute distance, date-clamped automatically)</em></li>
+          <li>"Of the devices that are overdue, which one is furthest from its destination?" <em>(Plan alerts)</em></li>
+          <li>"Was &lt;device&gt;'s last plan completed or cancelled, and what was its destination at the time?" <em>(Plan history)</em></li>
+          <li>"Compare how far &lt;device A&gt; and &lt;device B&gt; have each traveled in the last 7 days." <em>(List devices or Compute distance, twice)</em></li>
+          <li>"Which devices have gotten noticeably less accurate over the last month?" <em>(List devices)</em></li>
+          <li>"Who logged in last week, and did anyone archive a device during that time?" <em>(Audit log, twice — admin only)</em></li>
+        </ul>
+      </div>
+    </details>
+  `, { confirmLabel: 'Close', wide: true, onConfirm: () => {} });
 }
 
 function clearAiHistory() {

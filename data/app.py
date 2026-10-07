@@ -101,14 +101,18 @@ if not LLM_VERIFY_SSL:
 # progress-trend cutoff (see _compute_plan_status()).
 # 13 = device_plan_history.outcome — distinguishes a manual "mark arrived"
 # close-out from a plain cancellation on a 'deleted' row.
-SCHEMA_VERSION = 13
+# 14 = users.audit_access — per-admin grant (super admin only) for a regular
+# admin to see the Activity Log, Active Now, and use Ask Goby's
+# get_audit_log — all three are otherwise invisible/blocked entirely for a
+# regular admin, not just filtered.
+SCHEMA_VERSION = 14
 
 # App release version — bumped independently of SCHEMA_VERSION (a release can
 # ship with no schema change, or vice versa). Tracked the same way: stamped
 # into app_settings every startup, with a change logged to audit_log (not
 # just overwritten silently) so Management's Activity Log shows a real
 # history of what version was running when.
-APP_VERSION = "4.3"
+APP_VERSION = "4.7"
 
 
 def _load_or_create_secret_key() -> str:
@@ -479,6 +483,27 @@ def init_db():
             # to 1 (allowed) so upgrading an existing deployment doesn't
             # silently cut anyone off who was already using the feature.
             con.execute("ALTER TABLE users ADD COLUMN ai_access INTEGER NOT NULL DEFAULT 1")
+        if "audit_access" not in existing_user_cols:
+            if "can_view_super_admin_activity" in existing_user_cols:
+                # This dev instance already picked up an earlier, narrower
+                # same-day design (hiding only the super admin's own rows)
+                # before it shipped anywhere — corrected the same day to a
+                # full access grant covering the Activity Log, Active Now,
+                # and Ask Goby's get_audit_log, all three of which a regular
+                # admin otherwise can't see or use AT ALL, not just a
+                # filtered view of. Renamed in place rather than left as a
+                # second, dangling column, since the old one was never a
+                # real shipped feature with grant state worth preserving
+                # separately (every row was still 0).
+                con.execute("ALTER TABLE users RENAME COLUMN can_view_super_admin_activity TO audit_access")
+            else:
+                # Per-admin grant, super admin only. A regular admin has NO
+                # access at all to the Activity Log, Active Now, or Ask
+                # Goby's get_audit_log tool by default — not just a filtered
+                # view — until the super admin grants it here. Defaults to 0:
+                # a new per-user access flag defaults closed, same as
+                # ai_access's own non-migration default.
+                con.execute("ALTER TABLE users ADD COLUMN audit_access INTEGER NOT NULL DEFAULT 0")
         # The account literally named "admin" is always the super admin,
         # regardless of when/how it was created — re-asserted every startup
         # (not just on fresh installs) so this holds on existing deployments
@@ -1058,7 +1083,7 @@ def api_me():
     with sqlite3.connect(DB_PATH) as con:
         con.row_factory = sqlite3.Row
         user = con.execute(
-            "SELECT first_name, last_name FROM users WHERE id = ?", (session["user_id"],)
+            "SELECT first_name, last_name, audit_access FROM users WHERE id = ?", (session["user_id"],)
         ).fetchone()
         groups = con.execute("""
             SELECT g.id, g.name
@@ -1073,6 +1098,13 @@ def api_me():
         "is_super_admin": bool(session.get("is_super_admin")),
         "first_name": user["first_name"] if user else None,
         "last_name": user["last_name"] if user else None,
+        # Raw grant only — the super admin's own session is always fully
+        # allowed regardless of this value; combine with is_super_admin at
+        # the call site (admin.html gates the Activity Log/Active Now
+        # sections on is_super_admin || audit_access), same pattern as
+        # is_admin/is_super_admin being reported separately rather than
+        # pre-combined.
+        "audit_access": bool(user["audit_access"]) if user else False,
         "groups": [dict(g) for g in groups],
     })
 
@@ -1537,6 +1569,20 @@ def _user_ai_allowed(user_id: int) -> bool:
     return bool(row and row[0])
 
 
+def _has_audit_access(user_id: int) -> bool:
+    """Per-admin grant (users.audit_access), settable only by the super admin
+    (see admin_update_user()). A regular admin has NO access at all — not a
+    filtered view, the whole surface is blocked/hidden — to the Activity
+    Log, Active Now, or Ask Goby's get_audit_log tool unless this is true.
+    The super admin itself always has full access regardless of this flag —
+    callers should check session["is_super_admin"] first, same as every
+    other use of this restriction, rather than calling this for the super
+    admin's own session."""
+    with sqlite3.connect(DB_PATH) as con:
+        row = con.execute("SELECT audit_access FROM users WHERE id = ?", (user_id,)).fetchone()
+    return bool(row and row[0])
+
+
 def _llm_chat_once(messages: list[dict], tools: list[dict] | None = None) -> dict:
     """One non-streaming chat-completions call. Returns the full `choice`
     object (has both "message" — content and/or tool_calls — and
@@ -1550,7 +1596,7 @@ def _llm_chat_once(messages: list[dict], tools: list[dict] | None = None) -> dic
     clean error event rather than a crash."""
     payload = {
         "model": LLM_MODEL, "messages": messages,
-        "temperature": 0.1, "max_tokens": 1500, "stream": False,
+        "temperature": 0.1, "max_tokens": 2500, "stream": False,
     }
     if tools:
         payload["tools"] = tools
@@ -1754,6 +1800,43 @@ def _nearest_place(lat, lon):
     }
 
 
+def _resolve_place(name: str, country: str | None = None):
+    """Forward geocoding — the reverse of _nearest_place(): resolves a named
+    place to coordinates from the SAME vendored city list, rather than
+    resolving coordinates to a name. Didn't exist before this, so there was
+    previously no way to answer 'which devices are near <place>' or 'how
+    far is <device> from <place>' at all — only the other direction.
+
+    Exact case-insensitive name match preferred; falls back to a substring
+    match. A name alone can be genuinely ambiguous (confirmed real case:
+    "Dover" exists in Delaware, New Hampshire, New Jersey, and Ohio, among
+    others) — an optional `country` filter narrows the candidate pool
+    first; whatever's left is resolved to the single MOST POPULOUS match,
+    the same "pick the recognizable one" reasoning _nearest_place()'s own
+    secondary major-city lookup already uses, not a geographic guess. If
+    the result doesn't look right, the caller should pass `country` rather
+    than try a different spelling. Returns None if nothing matches at all,
+    or if no geodata is loaded."""
+    if not _GEO_CITIES:
+        return None
+    needle = (name or "").strip().lower()
+    if not needle:
+        return None
+    candidates = _GEO_CITIES
+    if country:
+        c_needle = country.strip().lower()
+        candidates = [
+            c for c in candidates
+            if c[3].lower() == c_needle or _GEO_COUNTRIES.get(c[3], "").lower() == c_needle
+        ]
+    exact = [c for c in candidates if c[2].lower() == needle]
+    pool = exact if exact else [c for c in candidates if needle in c[2].lower()]
+    if not pool:
+        return None
+    lat, lon, place_name, cc, admin1, _population = max(pool, key=lambda c: c[5])
+    return {"lat": lat, "lon": lon, "name": place_name, "admin1": admin1, "country": _GEO_COUNTRIES.get(cc, cc)}
+
+
 def _position_snapshot(pt) -> dict:
     """A single observation row as a position fact for the AI — timestamp
     plus the resolved nearest place, NEVER raw lat/lon. Same no-raw-
@@ -1899,15 +1982,76 @@ def _device_signal_quality(uuid: str) -> dict:
     regular dashboard's device cards — `_fleet_digest()` just never surfaced
     the aggregate). One cheap AVG() query, same always-included philosophy as
     distance_last_30_days_miles, so a fleet-wide comparison question has a
-    real number for every device without needing a new dedicated tool."""
+    real number for every device without needing a new dedicated tool.
+
+    Also compares the last 30 days against that all-time average, so a
+    question like "which devices have degrading signal quality" has a real
+    trend instead of only one static lifetime number. `accuracy` is a GPS
+    error RADIUS IN METERS (confirmed against real data: ranges ~19-255,
+    matches the dashboard card's "±Nm" display) — lower is better, the
+    OPPOSITE polarity from `confidence` (a 1-3 tier, higher is better) — so
+    the two trend directions below are computed with opposite sign, not
+    copy-pasted logic. A 5% relative move is the threshold for "improving"/
+    "worsening" vs. "stable", to avoid calling ordinary noise a real trend.
+    Needs at least 5 fixes in the last 30 days to say anything at all —
+    otherwise the recent average would be a near-meaningless single-digit
+    sample compared against a lifetime one."""
     with sqlite3.connect(DB_PATH) as con:
         row = con.execute(
             "SELECT AVG(confidence), AVG(accuracy) FROM observations WHERE uuid = ?", (uuid,)
         ).fetchone()
-    return {
+        recent = con.execute(
+            "SELECT AVG(confidence), AVG(accuracy), COUNT(*) FROM observations "
+            "WHERE uuid = ? AND obs_time >= datetime('now', '-30 days')", (uuid,)
+        ).fetchone()
+    result = {
         "avg_confidence": round(row[0], 2) if row[0] is not None else None,
         "avg_accuracy": round(row[1], 2) if row[1] is not None else None,
     }
+
+    def _trend(recent_val, all_time_val, higher_is_better):
+        if recent_val is None or all_time_val is None or all_time_val == 0:
+            return None
+        delta = (recent_val - all_time_val) / abs(all_time_val)
+        if not higher_is_better:
+            delta = -delta
+        return "improving" if delta > 0.05 else ("worsening" if delta < -0.05 else "stable")
+
+    if recent and recent[2] >= 5 and row[0] is not None:
+        result["recent_avg_confidence"] = round(recent[0], 2) if recent[0] is not None else None
+        result["recent_avg_accuracy"] = round(recent[1], 2) if recent[1] is not None else None
+        result["confidence_trend"] = _trend(recent[0], row[0], higher_is_better=True)
+        result["accuracy_trend"] = _trend(recent[1], row[1], higher_is_better=False)
+        result["signal_trend_window"] = "last 30 days vs. all-time average above"
+    else:
+        result["signal_trend_window"] = "not enough recent history to establish a trend"
+    return result
+
+
+def _device_current_speed(uuid: str) -> dict:
+    """Speed between a device's two most recent fixes — a quick, always-
+    current 'is it moving right now' signal, independent of whatever
+    historical window a movement/distance tool is separately asked about
+    (compute_distance's avg_speed_mph is a window AVERAGE including stops;
+    this is the instantaneous rate right now). None if fewer than 2 fixes
+    exist, or they share the same obs_time (can't divide by a zero
+    duration)."""
+    with sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            "SELECT lat, lon, obs_time FROM observations WHERE uuid = ? ORDER BY obs_time DESC LIMIT 2",
+            (uuid,),
+        ).fetchall()
+    if len(rows) < 2:
+        return {"current_speed_mph": None}
+    t_latest, t_prev = _parse_obs_time(rows[0]["obs_time"]), _parse_obs_time(rows[1]["obs_time"])
+    if not t_latest or not t_prev:
+        return {"current_speed_mph": None}
+    hours = (t_latest - t_prev).total_seconds() / 3600
+    if hours <= 0:
+        return {"current_speed_mph": None}
+    dist_miles = _haversine_meters(rows[1]["lat"], rows[1]["lon"], rows[0]["lat"], rows[0]["lon"]) / _METERS_PER_MILE
+    return {"current_speed_mph": round(dist_miles / hours, 1)}
 
 
 _ISO_DATE_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
@@ -2060,6 +2204,7 @@ def _device_insight(uuid: str, deep: bool = False, date_range=None) -> dict:
             total_distance = 0.0
             stops = 0
             longest_dwell_minutes = 0.0
+            dwell_entries = []
             cluster_anchor, cluster_start = pts[0], _parse_obs_time(pts[0]["obs_time"])
             for i in range(1, len(pts)):
                 total_distance += _haversine_meters(pts[i - 1]["lat"], pts[i - 1]["lon"], pts[i]["lat"], pts[i]["lon"])
@@ -2071,14 +2216,40 @@ def _device_insight(uuid: str, deep: bool = False, date_range=None) -> dict:
                         if dwell > 5:
                             stops += 1
                             longest_dwell_minutes = max(longest_dwell_minutes, dwell)
+                            dwell_entries.append({
+                                "lat": cluster_anchor["lat"], "lon": cluster_anchor["lon"],
+                                "duration_minutes": round(dwell, 1),
+                                "from": cluster_start.strftime("%Y-%m-%d %H:%M:%S"),
+                                "to": t_prev.strftime("%Y-%m-%d %H:%M:%S"),
+                            })
                     cluster_anchor, cluster_start = pts[i], _parse_obs_time(pts[i]["obs_time"])
             displacement = _haversine_meters(pts[0]["lat"], pts[0]["lon"], pts[-1]["lat"], pts[-1]["lon"])
+            window_start, window_end = _parse_obs_time(pts[0]["obs_time"]), _parse_obs_time(pts[-1]["obs_time"])
+            window_hours = (window_end - window_start).total_seconds() / 3600 if window_start and window_end else 0
             insight["movement"] = {
                 "total_distance_miles": round(total_distance / _METERS_PER_MILE, 2),
                 "straight_line_miles": round(displacement / _METERS_PER_MILE, 2),
+                # Average over the WHOLE window including stops — not the
+                # same number as get_device_status's current_speed_mph,
+                # which is the instantaneous rate between only the two most
+                # recent fixes regardless of what window this tool was
+                # asked about.
+                "avg_speed_mph": round((total_distance / _METERS_PER_MILE) / window_hours, 1) if window_hours > 0 else None,
                 "stop_count": stops,
                 "longest_dwell_minutes": round(longest_dwell_minutes, 1),
             }
+            # Named, not just counted — a bare "1 stop, 6 hours" doesn't say
+            # WHERE. Resolved through the same reverse-geocoding every other
+            # location-adjacent tool uses (_nearest_place(), never raw
+            # lat/lon); capped to the 5 longest so a device with many short
+            # stops doesn't pay for (or return) a geodata lookup per stop.
+            if dwell_entries:
+                dwell_entries.sort(key=lambda e: e["duration_minutes"], reverse=True)
+                insight["movement"]["dwell_locations"] = [{
+                    "near": _nearest_place(e["lat"], e["lon"]),
+                    "duration_minutes": e["duration_minutes"],
+                    "from": e["from"], "to": e["to"],
+                } for e in dwell_entries[:5]]
         else:
             # Explicit "don't know" rather than silently omitting the key —
             # otherwise the model has no signal and might guess at a distance.
@@ -2114,6 +2285,7 @@ def _fleet_digest(days: int | None = 30) -> dict:
     window changes, i.e. on every call)."""
     devices = _visible_devices()
     by_group: dict[str, int] = {}
+    by_country: dict[str, int] = {}
     summary = []
     for d in devices:
         by_group[d["group_name"]] = by_group.get(d["group_name"], 0) + 1
@@ -2124,6 +2296,7 @@ def _fleet_digest(days: int | None = 30) -> dict:
             "distance_miles": distance_miles,
             **_device_cadence(d["uuid"]),
             **_device_signal_quality(d["uuid"]),
+            **_device_current_speed(d["uuid"]),
             # Already computed by _visible_devices() itself — zero extra
             # cost here. null means no Smart Tracking plan exists for this
             # device; call get_plan_status for the full destination/ETA
@@ -2141,6 +2314,12 @@ def _fleet_digest(days: int | None = 30) -> dict:
         near = _nearest_place(d["lat"], d["lon"])
         if near:
             entry["near"] = near
+            # Tallied from the SAME _nearest_place() call already made for
+            # `near` above — zero extra geodata lookups, unlike
+            # get_country_history (which needs a dedicated per-day scan over
+            # a device's full history). This is only ever "current country",
+            # one call per device, already paid for.
+            by_country[near["country"]] = by_country.get(near["country"], 0) + 1
         summary.append(entry)
     # Pre-summed so the model never has to add the per-device figures itself —
     # small models are unreliable at multi-step arithmetic (confirmed: asked
@@ -2151,6 +2330,7 @@ def _fleet_digest(days: int | None = 30) -> dict:
     shown = summary[:50]
     result = {
         "device_count": len(devices), "devices_by_group": by_group,
+        "devices_by_country": by_country,
         "distance_window": window_label,
         "fleet_total_distance_miles": round(total_distance, 2),
         "devices": shown,
@@ -2242,10 +2422,16 @@ _AI_SYSTEM_PROMPT = (
     "the real current date given to you above — never estimate, assume, or "
     "fall back to your own sense of today's date, which will be wrong. "
     "Never add the per-device numbers yourself, you will get it wrong. "
-    "Be concise and direct — EXCEPT for a near.label value, which must always "
-    "be quoted completely, including any parenthetical secondary-city part "
-    "(e.g. '(~7.2 miles from Tampa, Florida, United States)') — trimming it "
-    "for brevity drops real information (a bigger, more recognizable "
+    "Be thorough and explanatory, not just a bare fact — explain what the "
+    "numbers actually mean, add relevant context already present in the "
+    "tool's own data (e.g. how a value compares to history, what a trend or "
+    "status field implies, why something might be notable), and don't just "
+    "state a number without saying what it indicates. This still never means "
+    "speculating beyond what a tool actually returned — only elaborating on "
+    "what it did return. A near.label value must always be quoted "
+    "completely regardless, including any parenthetical secondary-city part "
+    "(e.g. '(~7.2 miles from Tampa, Florida, United States)') — never trim "
+    "it, since doing so drops real information (a bigger, more recognizable "
     "reference point) just as much as dropping the state would."
 )
 
@@ -2309,9 +2495,14 @@ def _tool_get_device_status(args: dict) -> dict:
     if not d:
         return {"error": "device not found"}
     near = _nearest_place(d["lat"], d["lon"])
+    with sqlite3.connect(DB_PATH) as con:
+        first_seen = con.execute(
+            "SELECT MIN(obs_time) FROM observations WHERE uuid = ?", (d["uuid"],)
+        ).fetchone()[0]
     result = {"name": d["name"], "uuid": d["uuid"], "group": d["group_name"],
-              "fix_count": d["fix_count"], "last_seen": d["last_seen"],
-              **_device_cadence(d["uuid"]), **_device_signal_quality(d["uuid"])}
+              "fix_count": d["fix_count"], "last_seen": d["last_seen"], "first_seen": first_seen,
+              **_device_cadence(d["uuid"]), **_device_signal_quality(d["uuid"]),
+              **_device_current_speed(d["uuid"])}
     if near:
         result["near"] = near
     if d.get("fix_count_window"):
@@ -2450,18 +2641,18 @@ def _tool_get_plan_history(args: dict) -> dict:
 def _tool_get_audit_log(args: dict) -> dict:
     # Checked here, at the point of use — not a keyword-triggered guess like
     # the old design — so a non-admin's tool call is rejected outright
-    # regardless of what the model asks for.
+    # regardless of what the model asks for. Same restriction as
+    # GET /api/admin/audit-log: a regular admin has NO audit log access at
+    # all unless explicitly granted audit_access, not a filtered view — so
+    # this can't be used as a back door around the Activity Log page being
+    # invisible to them in the first place.
     if not session.get("is_admin"):
         return {"error": "admin privileges required"}
+    if not session.get("is_super_admin") and not _has_audit_access(session["user_id"]):
+        return {"error": "audit log access has not been granted to your account by the super admin"}
     limit = min(int(args.get("limit") or 50), 500)
     query = "SELECT ts, username, action, target, detail FROM audit_log WHERE 1=1"
     params = []
-    if not session.get("is_super_admin"):
-        # Same restriction as GET /api/admin/audit-log — the super admin's
-        # own activity is visible only to itself, so a regular admin asking
-        # Goby about it must get the same filtered view the Activity Log
-        # page would show them, not an unfiltered one through a back door.
-        query += " AND username NOT IN (SELECT username FROM users WHERE is_super_admin = 1)"
     username_filter = args.get("username")
     if username_filter:
         # Resolves a display name ("Tho Pham") to the real username audit_log
@@ -2542,6 +2733,147 @@ def _tool_get_reporting_gaps(args: dict) -> dict:
             "largest_gaps": gaps[:limit]}
 
 
+def _tool_get_plan_alerts(args: dict) -> dict:
+    """Fleet-wide Smart Tracking alerts — every visible device whose
+    plan_status is 'overdue' or 'moving_away', mirroring the dashboard's own
+    topbar alerts bell (see CLAUDE.md's Smart Tracking stage 3) so 'which
+    devices need attention' doesn't require the model to call list_devices
+    and then reason about plan_status itself across every entry. Reuses
+    get_plan_status's own per-device output (destination/ETA/distance
+    detail) rather than duplicating its logic, same pattern get_device_status
+    already uses for the same tool. Overdue sorts first, same priority
+    _compute_plan_status() itself uses when a device is somehow both."""
+    devices = _visible_devices()
+    alerts = []
+    for d in devices:
+        if d["plan_status"] in ("overdue", "moving_away"):
+            status = _tool_get_plan_status({"device": d["uuid"]})
+            status["group"] = d["group_name"]
+            alerts.append(status)
+    alerts.sort(key=lambda a: 0 if a["status"] == "overdue" else 1)
+    return {"alert_count": len(alerts), "alerts": alerts}
+
+
+def _tool_get_group_devices(args: dict) -> dict:
+    """Devices in one named group (or 'Unassigned'), pre-filtered from the
+    same _visible_devices() every other tool uses — a 'who's in the Alpha
+    group' question otherwise needs the model to filter list_devices' flat
+    per-device output itself, which it has no reliable way to do (group
+    membership is derived at query time, not a fixed list the model could
+    already know). Exact name match preferred; falls back to a substring
+    match only if no exact match exists, same resolve-by-name spirit as
+    _resolve_device()."""
+    group_name = (args.get("group") or "").strip()
+    if not group_name:
+        return {"error": "group name is required"}
+    devices = _visible_devices()
+    needle = group_name.lower()
+    matches = [d for d in devices if d["group_name"].lower() == needle]
+    if not matches:
+        matches = [d for d in devices if needle in d["group_name"].lower()]
+    return {
+        "group": group_name, "device_count": len(matches),
+        "devices": [{"name": d["name"], "uuid": d["uuid"], "last_seen": d["last_seen"],
+                      "plan_status": d["plan_status"]} for d in matches],
+    }
+
+
+def _tool_get_country_history(args: dict) -> dict:
+    """Which countries a device has physically been in over time, and when —
+    e.g. for 'did it cross from Iraq into Jordan' or 'which countries has it
+    been in'. Resolves only ONE representative fix per UTC day (the day's
+    first fix) through the same reverse-geocoding _nearest_place() already
+    uses for a device's current position — resolving every raw historical
+    fix (a device can have thousands) through the ~70k-row geodata scan
+    would be far too slow for a single tool call; one lookup per day bounds
+    the cost to at most `days` lookups. Consecutive days resolving to the
+    same country are collapsed into a single 'stay' (country/first_seen/
+    last_seen) rather than listing every sampled day separately, so the
+    answer reads as actual border crossings, not a long flat day list.
+    Approximates a device's country as whichever vendored city is nearest —
+    there are no real country-boundary polygons in this app's geodata, just
+    city points — so a device very close to a border could occasionally be
+    attributed to the wrong side; this is a deliberate accuracy/cost
+    tradeoff, not a bug, and the tool's description below says so."""
+    d = _resolve_device(args.get("device"), _visible_devices())
+    if not d:
+        return {"error": "device not found"}
+    if not _GEO_CITIES:
+        return {"error": "no geodata loaded — country history is unavailable"}
+    days = min(int(args.get("days") or 180), 365)
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+    with sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            "SELECT obs_time, lat, lon FROM observations WHERE uuid = ? AND obs_time >= ? ORDER BY obs_time",
+            (d["uuid"], cutoff),
+        ).fetchall()
+    daily: dict[str, tuple] = {}
+    for r in rows:
+        day = r["obs_time"][:10]
+        if day not in daily:
+            daily[day] = (r["lat"], r["lon"])
+    stays = []
+    for day in sorted(daily):
+        lat, lon = daily[day]
+        near = _nearest_place(lat, lon)
+        country = near["country"] if near else None
+        if stays and stays[-1]["country"] == country:
+            stays[-1]["last_seen"] = day
+        else:
+            stays.append({"country": country, "first_seen": day, "last_seen": day})
+    return {
+        "name": d["name"], "uuid": d["uuid"], "window_days": days,
+        "sampling_note": "one representative fix per day, not every fix — approximate, see tool description",
+        "country_stays": stays,
+    }
+
+
+def _tool_find_devices_near_place(args: dict) -> dict:
+    """Forward geocoding — resolves a named place via _resolve_place() (the
+    reverse of every other location tool, which only ever resolves
+    coordinates TO a name) then reports distance from it to every visible
+    device, closest first. Covers two question shapes with one tool: 'which
+    devices are near <place>' (fleet-wide, optionally filtered to
+    radius_miles) and 'how far is <device> from <place>' (pass device to
+    scope to just that one — radius_miles is ignored in that case, a single
+    device's distance is reported regardless). Never returns the resolved
+    place's own coordinates, same no-raw-coordinates rule as everywhere
+    else — only its name and the computed distances."""
+    place = (args.get("place") or "").strip()
+    if not place:
+        return {"error": "place is required"}
+    resolved = _resolve_place(place, args.get("country"))
+    if not resolved:
+        suffix = f" in '{args['country']}'" if args.get("country") else ""
+        return {"error": f"no known place matching '{place}'{suffix} — try a nearby larger city, or pass country to disambiguate"}
+    devices = _visible_devices()
+    device_filter = args.get("device")
+    if device_filter:
+        d = _resolve_device(device_filter, devices)
+        if not d:
+            return {"error": "device not found"}
+        devices = [d]
+    results = [{
+        "name": d["name"], "uuid": d["uuid"],
+        "distance_miles": round(_haversine_meters(d["lat"], d["lon"], resolved["lat"], resolved["lon"]) / _METERS_PER_MILE, 1),
+    } for d in devices]
+    results.sort(key=lambda r: r["distance_miles"])
+    radius_miles = None
+    if not device_filter and args.get("radius_miles") is not None:
+        try:
+            radius_miles = float(args["radius_miles"])
+            results = [r for r in results if r["distance_miles"] <= radius_miles]
+        except (TypeError, ValueError):
+            return {"error": "radius_miles must be a number"}
+    return {
+        "place": _place_label(resolved["name"], resolved["admin1"], resolved["country"]),
+        "radius_miles": radius_miles,
+        "device_count": len(results),
+        "devices": results,
+    }
+
+
 _AI_TOOL_DISPATCH = {
     "list_devices": _tool_list_devices,
     "get_device_status": _tool_get_device_status,
@@ -2551,26 +2883,30 @@ _AI_TOOL_DISPATCH = {
     "get_reporting_gaps": _tool_get_reporting_gaps,
     "get_plan_status": _tool_get_plan_status,
     "get_plan_history": _tool_get_plan_history,
+    "get_plan_alerts": _tool_get_plan_alerts,
+    "get_group_devices": _tool_get_group_devices,
+    "get_country_history": _tool_get_country_history,
+    "find_devices_near_place": _tool_find_devices_near_place,
 }
 
 _AI_TOOLS = [
     {"type": "function", "function": {
         "name": "list_devices",
-        "description": "List every device visible to the current user, with group, fix count, last-seen time, approximate location, cadence/staleness, average confidence/accuracy, distance traveled over a given window (plus a combined fleet total), and plan_status ('on_track'/'overdue'/'moving_away', or null if the device has no Smart Tracking plan). plan_status alone is already enough for 'which devices are overdue/on track/moving away' — only call get_plan_status for a device's actual destination/ETA detail. A device with an active plan never counts distance OR fix_count from before that plan's start_date, even if the requested window reaches further back — when this clamp actually narrows a device's own window below the one you asked for, that device's entry carries its own 'distance_window' and/or 'fix_count_window' field overriding the defaults; state that device's distance/fix count using its own window field, not the fleet-wide one.",
+        "description": "List every device visible to the current user, with group, fix count, last-seen time, approximate location, cadence/staleness, average confidence/accuracy (plus a recent-30-days-vs-all-time confidence_trend/accuracy_trend of 'improving'/'worsening'/'stable' — note accuracy is a GPS error RADIUS IN METERS so 'improving' means the number got SMALLER, the opposite of confidence), current_speed_mph (instantaneous rate between the two most recent fixes, not a window average), distance traveled over a given window (plus a combined fleet total), and plan_status ('on_track'/'overdue'/'moving_away', or null if the device has no Smart Tracking plan). plan_status alone is already enough for 'which devices are overdue/on track/moving away' — only call get_plan_status for a device's actual destination/ETA detail, or get_plan_alerts for the fleet-wide list of only the ones needing attention. Also includes a top-level devices_by_country count (each device's CURRENT country only, from its latest position — for a device's country history over time use get_country_history instead; for 'which devices are near <place>' use find_devices_near_place instead, which works off a named place rather than a country name). A device with an active plan never counts distance OR fix_count from before that plan's start_date, even if the requested window reaches further back — when this clamp actually narrows a device's own window below the one you asked for, that device's entry carries its own 'distance_window' and/or 'fix_count_window' field overriding the defaults; state that device's distance/fix count using its own window field, not the fleet-wide one.",
         "parameters": {"type": "object", "properties": {
             "days": {"type": "integer", "description": "How many days back to compute distance traveled over. Default 30 if omitted. Pass 0 for all-time."},
         }},
     }},
     {"type": "function", "function": {
         "name": "get_device_status",
-        "description": "Fix count, cadence/staleness, average confidence/accuracy, approximate current location, and full Smart Tracking plan detail (destination, ETA, computed status) for one specific device — already includes everything get_plan_status would return for this device, under the 'plan' field (plan.has_plan is false if none exists), so there's no need to call get_plan_status separately after this for the same device. A device with an active plan never counts fix_count from before that plan's start_date — when that clamp applies, a 'fix_count_window' field states it explicitly.",
+        "description": "Fix count, first_seen (when this device was first ever tracked), cadence/staleness, average confidence/accuracy (plus a recent-30-days-vs-all-time confidence_trend/accuracy_trend of 'improving'/'worsening'/'stable' — accuracy is a GPS error RADIUS IN METERS so 'improving' means the number got SMALLER, the opposite of confidence), current_speed_mph (instantaneous rate between the two most recent fixes), approximate current location, and full Smart Tracking plan detail (destination, ETA, computed status) for one specific device — already includes everything get_plan_status would return for this device, under the 'plan' field (plan.has_plan is false if none exists), so there's no need to call get_plan_status separately after this for the same device. A device with an active plan never counts fix_count from before that plan's start_date — when that clamp applies, a 'fix_count_window' field states it explicitly.",
         "parameters": {"type": "object", "properties": {
             "device": {"type": "string", "description": "Device name or UUID"},
         }, "required": ["device"]},
     }},
     {"type": "function", "function": {
         "name": "compute_distance",
-        "description": "Distance traveled, movement pattern, and dwell/stop time for one device, optionally within a date range. If the device has an active Smart Tracking plan, distance never counts from before that plan's start_date, even if start_date/'all-time' would otherwise reach further back — the response's movement_window field states the actual window used (it says so explicitly when the plan start clamped it), state that window rather than assuming the one requested.",
+        "description": "Distance traveled, average speed (avg_speed_mph, a whole-window average including stops — not the same as get_device_status's current_speed_mph), movement pattern, and dwell/stop time for one device, optionally within a date range. Up to the 5 longest stops are individually named (dwell_locations: nearest known place, duration, from/to) rather than only counted. If the device has an active Smart Tracking plan, distance never counts from before that plan's start_date, even if start_date/'all-time' would otherwise reach further back — the response's movement_window field states the actual window used (it says so explicitly when the plan start clamped it), state that window rather than assuming the one requested.",
         "parameters": {"type": "object", "properties": {
             "device": {"type": "string", "description": "Device name or UUID"},
             "start_date": {"type": "string", "description": "ISO 8601 date, e.g. 2026-09-01. Omit for all-time."},
@@ -2618,6 +2954,36 @@ _AI_TOOLS = [
             "device": {"type": "string", "description": "Device name or UUID"},
             "limit": {"type": "integer", "description": "Max entries to return, default 10, capped at 50"},
         }, "required": ["device"]},
+    }},
+    {"type": "function", "function": {
+        "name": "get_plan_alerts",
+        "description": "Every visible device whose Smart Tracking plan status is currently 'overdue' or 'moving_away' (on_track devices are never included) — the fleet-wide version of plan_status, for 'which devices need attention/are overdue/are moving away' without having to call list_devices and check every device's plan_status yourself. Each alert is the full get_plan_status detail for that device (destination, ETA, distances) plus its group. Overdue entries come first.",
+        "parameters": {"type": "object", "properties": {}},
+    }},
+    {"type": "function", "function": {
+        "name": "get_group_devices",
+        "description": "List every visible device in one named group — use for 'which devices are in <group>' or 'how many devices does <group> have'. Pass 'Unassigned' for devices with no derived group. Only returns devices the current user can already see, same as every other tool.",
+        "parameters": {"type": "object", "properties": {
+            "group": {"type": "string", "description": "Group name, e.g. 'Alpha' or 'Unassigned'"},
+        }, "required": ["group"]},
+    }},
+    {"type": "function", "function": {
+        "name": "get_country_history",
+        "description": "Which countries a device has physically been in over time, as a list of 'stays' (country, first_seen, last_seen) — use for 'which countries has it been in', 'did it cross from X to Y', or any question about a device's international movement over time. This is an APPROXIMATION sampled once per day (not every fix) and resolved to the nearest known city's country, not a real country-boundary check — a device very near a border could occasionally show the wrong side for a day or two; say so if the question seems to hinge on a precise border crossing. Defaults to the last 180 days.",
+        "parameters": {"type": "object", "properties": {
+            "device": {"type": "string", "description": "Device name or UUID"},
+            "days": {"type": "integer", "description": "How many days back to look, default 180, capped at 365"},
+        }, "required": ["device"]},
+    }},
+    {"type": "function", "function": {
+        "name": "find_devices_near_place",
+        "description": "Resolves a named place (city) to a location and reports distance from it to every visible device, closest first — the REVERSE of every other location tool here, which only ever turns device coordinates INTO a place name. Use for 'which devices are near <place>' (optionally pass radius_miles to only list ones within that distance) or 'how far is <device> from <place>' (pass device to scope to just that one device). A place name can be genuinely ambiguous (e.g. more than one real city named 'Dover') — it resolves to the most populous match by default; if the result looks wrong, pass country to disambiguate rather than trying a different spelling. Never reveals the resolved place's own exact coordinates.",
+        "parameters": {"type": "object", "properties": {
+            "place": {"type": "string", "description": "A city/place name, e.g. 'Baghdad' or 'Dover'"},
+            "country": {"type": "string", "description": "Optional — narrows an ambiguous place name to one country"},
+            "device": {"type": "string", "description": "Optional — scope to just this device's distance from the place, instead of every visible device"},
+            "radius_miles": {"type": "number", "description": "Optional — only list devices within this distance. Ignored if device is set."},
+        }, "required": ["place"]},
     }},
 ]
 
@@ -2806,7 +3172,8 @@ def admin_users():
         with sqlite3.connect(DB_PATH) as con:
             con.row_factory = sqlite3.Row
             users = con.execute(
-                "SELECT id, username, first_name, last_name, is_admin, is_super_admin, ai_access, created_at "
+                "SELECT id, username, first_name, last_name, is_admin, is_super_admin, ai_access, "
+                "audit_access, created_at "
                 "FROM users ORDER BY username"
             ).fetchall()
             groups_by_user: dict[int, list] = {}
@@ -2820,6 +3187,7 @@ def admin_users():
             "first_name": u["first_name"], "last_name": u["last_name"],
             "is_admin": bool(u["is_admin"]), "is_super_admin": bool(u["is_super_admin"]),
             "ai_access": bool(u["ai_access"]),
+            "audit_access": bool(u["audit_access"]),
             "created_at": u["created_at"], "groups": groups_by_user.get(u["id"], []),
         } for u in users])
 
@@ -2865,17 +3233,19 @@ def admin_update_user(user_id):
     if _super_admin_protected(user_id):
         return jsonify({"error": "the super admin account can only be modified by itself"}), 403
     data = request.get_json(force=True, silent=True) or {}
-    if "ai_access" in data and not session.get("is_super_admin"):
-        # Per-user Ask Goby access is deliberately scoped tighter than every
-        # other field this route accepts — admin_required (any admin) gates
-        # the route itself, but this one field is super-admin-only, same
-        # no-exceptions pattern as the AI runtime toggle (PATCH
-        # /api/admin/ai-settings) and private-device ownership.
+    if ("ai_access" in data or "audit_access" in data) and not session.get("is_super_admin"):
+        # Per-user Ask Goby access, and the audit log access grant below, are
+        # both deliberately scoped tighter than every other field this route
+        # accepts — admin_required (any admin) gates the route itself, but
+        # these fields are super-admin-only, same no-exceptions pattern as
+        # the AI runtime toggle (PATCH /api/admin/ai-settings) and
+        # private-device ownership.
         return jsonify({"error": "super admin privileges required"}), 403
     with sqlite3.connect(DB_PATH) as con:
         target_row = con.execute("SELECT username FROM users WHERE id = ?", (user_id,)).fetchone()
         target_username = target_row[0] if target_row else str(user_id)
-        changed = [f for f in ("first_name", "last_name", "is_admin", "group_ids", "ai_access") if f in data]
+        changed = [f for f in ("first_name", "last_name", "is_admin", "group_ids", "ai_access",
+                                "audit_access") if f in data]
 
         if "first_name" in data:
             con.execute("UPDATE users SET first_name = ? WHERE id = ?",
@@ -2918,6 +3288,9 @@ def admin_update_user(user_id):
         if "ai_access" in data:
             con.execute("UPDATE users SET ai_access = ? WHERE id = ?",
                         (1 if data["ai_access"] else 0, user_id))
+        if "audit_access" in data:
+            con.execute("UPDATE users SET audit_access = ? WHERE id = ?",
+                        (1 if data["audit_access"] else 0, user_id))
         con.commit()
     log_activity("user.update", target=target_username, detail=f"fields={','.join(changed)}")
     return jsonify({"ok": True})
@@ -3228,17 +3601,17 @@ def admin_update_device(uuid):
 @app.route("/api/admin/audit-log")
 @admin_required
 def admin_audit_log():
+    # admin_required only confirms is_admin — the Activity Log itself is a
+    # SEPARATE, narrower gate: a regular admin has no access to it at all
+    # unless the super admin has explicitly granted audit_access. This is
+    # not a row filter (unlike the design's first draft) — once granted, a
+    # regular admin sees the exact same rows the super admin would, no
+    # exclusions.
+    if not session.get("is_super_admin") and not _has_audit_access(session["user_id"]):
+        return jsonify({"error": "audit log access has not been granted to your account by the super admin"}), 403
     limit = min(int(request.args.get("limit", 200)), 1000)
     query = "SELECT id, ts, username, action, target, detail, ip FROM audit_log WHERE 1=1"
     params = []
-    if not session.get("is_super_admin"):
-        # The super admin's own activity (including login_failed attempts
-        # logged under its literal username pre-auth) is visible only to
-        # itself — a regular admin sees every other admin's activity but
-        # never this. Matched by username against the real users table
-        # rather than a hardcoded "admin" literal, same reasoning as every
-        # other is_super_admin check in this app.
-        query += " AND username NOT IN (SELECT username FROM users WHERE is_super_admin = 1)"
     query += " ORDER BY id DESC LIMIT ?"
     params.append(limit)
     with sqlite3.connect(DB_PATH) as con:
@@ -3263,7 +3636,15 @@ def admin_active_users():
     plain signed cookies), so "active" here means "made a request recently,"
     not "holds a cookie that hasn't expired yet." A user who closes their
     browser without logging out will simply stop appearing here once they go
-    quiet, same as the dashboard's own online/offline feel elsewhere."""
+    quiet, same as the dashboard's own online/offline feel elsewhere.
+
+    Same access model as the Activity Log — admin_required only confirms
+    is_admin; a regular admin has no access to this section at all unless
+    explicitly granted audit_access by the super admin. Not a row filter —
+    once granted, a regular admin sees every account's presence including
+    the super admin's own."""
+    if not session.get("is_super_admin") and not _has_audit_access(session["user_id"]):
+        return jsonify({"error": "audit log access has not been granted to your account by the super admin"}), 403
     minutes = int(request.args.get("minutes") or ACTIVE_USER_WINDOW_MINUTES)
     query = """
         SELECT username, is_admin, is_super_admin, last_seen_at
@@ -3271,10 +3652,6 @@ def admin_active_users():
         WHERE last_seen_at >= datetime('now', ?)
     """
     params = [f"-{minutes} minutes"]
-    if not session.get("is_super_admin"):
-        # The super admin's own active-session presence is visible only to
-        # itself — same restriction as the audit log, for the same reason.
-        query += " AND is_super_admin = 0"
     query += " ORDER BY last_seen_at DESC"
     with sqlite3.connect(DB_PATH) as con:
         con.row_factory = sqlite3.Row

@@ -276,7 +276,7 @@ input[type="color"] {
     </form>
   </section>
 
-  <section>
+  <section id="active-now-section" style="display:none;">
     <div class="section-header">
       <h2>Active Now</h2>
       <span id="active-users-count" class="setting-hint"></span>
@@ -333,7 +333,7 @@ input[type="color"] {
     <div id="archived-list"></div>
   </section>
 
-  <section>
+  <section id="audit-log-section" style="display:none;">
     <div class="section-header">
       <h2>Activity Log</h2>
       <span id="audit-log-count" class="setting-hint"></span>
@@ -663,6 +663,7 @@ function renderUsers() {
         <div class="card-title">
           ${u.username}
           ${u.is_super_admin ? '<span class="chip private">super admin</span>' : (u.is_admin ? '<span class="chip admin">admin</span>' : '')}
+          ${u.audit_access ? '<span class="chip" title="Can see the Activity Log, Active Now, and use Ask Goby\'s audit-log tool">has audit log access</span>' : ''}
         </div>
         ${fullName ? `<div class="card-fullname">${escapeHtml(fullName)}</div>` : ''}
         <div class="card-sub">
@@ -675,6 +676,7 @@ function renderUsers() {
           <button class="btn" onclick="editUserGroups(${u.id})">Edit groups</button>
           ${isSelfSuperAdmin ? '' : `<button class="btn" onclick="toggleAdmin(${u.id}, ${u.is_admin})">${u.is_admin ? 'Revoke admin' : 'Make admin'}</button>`}
           ${currentUser?.is_super_admin ? `<button class="btn" onclick="toggleAiAccess(${u.id}, ${u.ai_access})">${u.ai_access ? 'Disable Ask Goby' : 'Enable Ask Goby'}</button>` : ''}
+          ${currentUser?.is_super_admin && u.is_admin && !u.is_super_admin ? `<button class="btn" onclick="toggleAuditAccess(${u.id}, ${u.audit_access})">${u.audit_access ? 'Revoke audit log access' : 'Grant audit log access'}</button>` : ''}
           <button class="btn" onclick="resetPassword(${u.id})">Reset password</button>
           ${isSelfSuperAdmin ? '' : `<button class="btn danger" onclick="deleteUser(${u.id})">Delete</button>`}
         `}
@@ -780,6 +782,20 @@ async function toggleAdmin(id, isAdmin) {
 async function toggleAiAccess(id, aiAccess) {
   try {
     await api(`/api/admin/users/${id}`, { method: 'PATCH', body: JSON.stringify({ ai_access: !aiAccess }) });
+    showMsg('Updated');
+    await loadUsers();
+  } catch (e) { showMsg(e.message, true); }
+}
+
+// Super admin only — grants/revokes a regular admin's access to the
+// Activity Log, Active Now, and Ask Goby's audit-log tool, all three of
+// which a regular admin otherwise can't see or use AT ALL (not a filtered
+// view — the whole surface is blocked). Server independently enforces this
+// (403 for anyone else), this button is just not offered otherwise. A
+// granted admin sees everything, including the super admin's own activity.
+async function toggleAuditAccess(id, auditAccess) {
+  try {
+    await api(`/api/admin/users/${id}`, { method: 'PATCH', body: JSON.stringify({ audit_access: !auditAccess }) });
     showMsg('Updated');
     await loadUsers();
   } catch (e) { showMsg(e.message, true); }
@@ -1138,11 +1154,22 @@ async function loadAll() {
   document.getElementById('user-menu-name').textContent = displayName;
   document.getElementById('user-menu-fullname').textContent = displayName;
   document.getElementById('user-menu-username').textContent = fullName ? `@${currentUser.username}` : '';
-  await Promise.all([loadGroups(), loadCodes(), loadUsers(), loadUnassigned(), loadPrivateDevices(), loadArchivedDevices(), loadAuditLog(), loadVersion(), loadAiSettings(), loadActiveUsers()]);
+  const loaders = [loadGroups(), loadCodes(), loadUsers(), loadUnassigned(), loadPrivateDevices(), loadArchivedDevices(), loadVersion(), loadAiSettings()];
+  // Activity Log and Active Now are a single combined grant
+  // (audit_access) — a regular admin without it has NO access to either
+  // section at all, not a filtered view, so both sections stay
+  // display:none and neither fetch ever fires for them.
+  const hasAuditAccess = currentUser.is_super_admin || currentUser.audit_access;
+  if (hasAuditAccess) {
+    document.getElementById('active-now-section').style.display = 'block';
+    document.getElementById('audit-log-section').style.display = 'block';
+    loaders.push(loadAuditLog(), loadActiveUsers());
+  }
+  await Promise.all(loaders);
   // "Active now" is inherently live — unlike every other section here (which
   // intentionally loads once and expects a page reload for fresh data), a
   // stale "who's online" list would defeat the point of the feature.
-  setInterval(loadActiveUsers, 30000);
+  if (hasAuditAccess) setInterval(loadActiveUsers, 30000);
 }
 
 async function loadActiveUsers() {
