@@ -363,6 +363,14 @@ input[type="color"] {
     </div>
     <div id="ai-settings-status" class="setting-hint" style="margin-bottom:8px;"></div>
     <button id="ai-settings-toggle-btn" onclick="toggleAiEnabled()"></button>
+
+    <div style="margin-top:18px; padding-top:14px; border-top:1px solid #30363d;">
+      <div class="setting-hint" style="margin-bottom:8px;">
+        Scheduled plan monitoring — periodically has Goby assess any plan that's overdue, moving away, or stalled, and write a short narration. Requires Ask Goby to be enabled above; turning Ask Goby off also stops this, even if left on here.
+      </div>
+      <div id="plan-monitor-status" class="setting-hint" style="margin-bottom:8px;"></div>
+      <button id="plan-monitor-toggle-btn" onclick="togglePlanMonitorEnabled()"></button>
+    </div>
   </section>
 
   <div id="version-info"></div>
@@ -1217,15 +1225,33 @@ function renderAiSettings(s) {
   aiSettingsState = s;
   const statusEl = document.getElementById('ai-settings-status');
   const btn = document.getElementById('ai-settings-toggle-btn');
+  const pmStatusEl = document.getElementById('plan-monitor-status');
+  const pmBtn = document.getElementById('plan-monitor-toggle-btn');
   if (!s.configured) {
     statusEl.textContent = 'No LLM backend is configured (LLM_API_BASE_URL is unset) — nothing to toggle yet.';
     btn.style.display = 'none';
+    pmStatusEl.textContent = '';
+    pmBtn.style.display = 'none';
     return;
   }
   statusEl.textContent = `Ask Goby is currently ${s.enabled ? 'enabled' : 'disabled'} for all users.`;
   btn.style.display = 'inline-block';
   btn.textContent = s.enabled ? 'Disable Ask Goby' : 'Enable Ask Goby';
   btn.className = s.enabled ? 'btn danger' : 'btn-primary';
+
+  // Plan monitoring can only ever actually run while Ask Goby itself is
+  // enabled (see _plan_monitor_enabled() — both gates are checked every
+  // cycle) — the toggle still reflects its own stored value even when Ask
+  // Goby is off, but the status line says plainly that it's not doing
+  // anything right now, rather than implying it's active.
+  if (!s.enabled) {
+    pmStatusEl.textContent = `Plan monitoring is set to ${s.plan_monitor_enabled ? 'on' : 'off'}, but won't run while Ask Goby is disabled above.`;
+  } else {
+    pmStatusEl.textContent = `Scheduled plan monitoring is currently ${s.plan_monitor_enabled ? 'on' : 'off'}.`;
+  }
+  pmBtn.style.display = 'inline-block';
+  pmBtn.textContent = s.plan_monitor_enabled ? 'Turn off plan monitoring' : 'Turn on plan monitoring';
+  pmBtn.className = s.plan_monitor_enabled ? 'btn danger' : 'btn-primary';
 }
 
 async function toggleAiEnabled() {
@@ -1235,6 +1261,16 @@ async function toggleAiEnabled() {
     }));
   } catch (e) {
     document.getElementById('ai-settings-status').textContent = e.message || 'Failed to update — try again.';
+  }
+}
+
+async function togglePlanMonitorEnabled() {
+  try {
+    renderAiSettings(await api('/api/admin/ai-settings', {
+      method: 'PATCH', body: JSON.stringify({ plan_monitor_enabled: !aiSettingsState.plan_monitor_enabled }),
+    }));
+  } catch (e) {
+    document.getElementById('plan-monitor-status').textContent = e.message || 'Failed to update — try again.';
   }
 }
 

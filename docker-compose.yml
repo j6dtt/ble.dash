@@ -54,3 +54,12 @@ services:
       #                       # NVIDIA endpoint has a real cert and should always be verified) —
       #                       # never flip this default, only override it here on prod's own
       #                       # docker-compose.yml.
+      #
+      # Scheduled Smart Tracking plan monitoring (see CLAUDE.md's Smart
+      # Tracking section) — only runs at all once a super admin turns on
+      # app_settings.plan_monitor_enabled in Management (default OFF) AND
+      # Ask Goby itself is enabled; these two env vars just tune its cadence.
+      # PLAN_MONITOR_INTERVAL_SECONDS: "900"    # optional, this is already the default (15 min)
+      # PLAN_MONITOR_REASSESS_HOURS: "24"       # optional, this is already the default — how long
+      #                                         # a still-bad status can go without a fresh
+      #                                         # assessment even without a new transition

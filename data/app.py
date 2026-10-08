@@ -67,6 +67,17 @@ LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
 # larger model/prompt makes cold CPU inference in dev time out again.
 LLM_TIMEOUT_SECONDS = int(os.environ.get("LLM_TIMEOUT_SECONDS", 60))
 LLM_MAX_CONCURRENT = int(os.environ.get("LLM_MAX_CONCURRENT", 4))
+# Scheduled Smart Tracking plan monitoring (see _plan_monitor_loop()) — how
+# often the background thread re-scans every active plan, and how long a
+# "bad" status (overdue/moving_away/stalled) can go without a fresh Goby
+# assessment before it's refreshed again even without a new transition.
+# Both are ops-tuning knobs, not feature logic, hence env vars rather than
+# code constants (same split as AUDIT_LOG_RETENTION_DAYS vs. the detection
+# thresholds just below). Also gated by app_settings.plan_monitor_enabled
+# (super admin only, default OFF) AND _ai_feature_enabled() — see
+# _plan_monitor_enabled().
+PLAN_MONITOR_INTERVAL_SECONDS = int(os.environ.get("PLAN_MONITOR_INTERVAL_SECONDS", 900))
+PLAN_MONITOR_REASSESS_HOURS = int(os.environ.get("PLAN_MONITOR_REASSESS_HOURS", 24))
 # Default ON everywhere — dev's LLM_API_BASE_URL points at a real, properly
 # certed endpoint (NVIDIA hosted / Ollama on localhost) and should never skip
 # validation. Prod's self-hosted vLLM sits behind an internal/self-signed
@@ -105,14 +116,19 @@ if not LLM_VERIFY_SSL:
 # admin to see the Activity Log, Active Now, and use Ask Goby's
 # get_audit_log — all three are otherwise invisible/blocked entirely for a
 # regular admin, not just filtered.
-SCHEMA_VERSION = 14
+# 15 = Smart Tracking plan monitoring: device_plans.last_monitored_status /
+# last_assessed_at (transition/cooldown bookkeeping for the scheduled job,
+# see _plan_monitor_cycle()) and the new plan_assessments table (Goby's
+# generated narration for a plan currently overdue/moving_away/stalled,
+# scheduled or on-demand — see _generate_plan_assessment()).
+SCHEMA_VERSION = 15
 
 # App release version — bumped independently of SCHEMA_VERSION (a release can
 # ship with no schema change, or vice versa). Tracked the same way: stamped
 # into app_settings every startup, with a change logged to audit_log (not
 # just overwritten silently) so Management's Activity Log shows a real
 # history of what version was running when.
-APP_VERSION = "4.7"
+APP_VERSION = "4.8"
 
 
 def _load_or_create_secret_key() -> str:
@@ -291,15 +307,41 @@ def _visibility_sql() -> tuple[str, list]:
 # direction counts, not silence itself.
 _OVERDUE_GRACE_HOURS = 24
 _PROGRESS_TREND_THRESHOLD_MILES = 50
+# Stalled: the closest-ever approach hasn't improved by more than this many
+# miles in at least this many days since start_date, and the device is still
+# clearly outside the destination radius. Added after a real live case
+# (device 4ZG0P0, declared plan Florida -> Abu Dhabi) showed moving_away's own
+# regression check structurally can't see a flat line — a device that never
+# improves on its starting distance never "exceeds" the best approach either,
+# so it stayed on_track right up to the overdue grace period despite zero
+# progress in days. Deliberately NOT a raw required-speed ceiling: at
+# 7,839.7mi over 29 remaining days the math-required average speed was only
+# ~11mph, which looks perfectly plausible on paper — the real tell was zero
+# movement at all for several days, not an implausible number. _MIN_DAYS
+# avoids flagging normal day-1/day-2 noise before there's enough history to
+# judge; both deliberately conservative starting defaults, same spirit as
+# _PROGRESS_TREND_THRESHOLD_MILES above.
+_STALL_MIN_DAYS_SINCE_PROGRESS = 2
+_STALL_PROGRESS_FLOOR_MILES = 5
 
 
 def _compute_plan_status(uuid: str, plan_row, current_lat=None, current_lon=None) -> dict:
     """Deterministic plan status for one device — `status` is "overdue",
-    "moving_away", or "on_track" (overdue takes priority if both are true,
-    since it's the more directly actionable signal). `current_lat`/`lon` can
+    "moving_away", "stalled", or "on_track" (priority in that order when more
+    than one condition is true — overdue is the most directly actionable,
+    stalled is the weakest signal of the three since it only means "no
+    improvement yet", not "actively getting worse"). `current_lat`/`lon` can
     be passed in by a caller that already has the device's latest position
     (e.g. _visible_devices()) to avoid a redundant query; callers without it
-    (e.g. the Ask Goby tool) get it queried here instead."""
+    (e.g. the Ask Goby tool) get it queried here instead.
+
+    Also returns `required_avg_speed_mph` — the sustained speed needed, with
+    zero stops, to cover the remaining distance by eta_end — as a
+    self-documenting field so Goby (and the scheduled plan-assessment job,
+    see _generate_plan_assessment()) can quote a real number instead of
+    computing this arithmetic itself each time. Only a hint, not a detection
+    signal on its own: a plausible-looking required speed (see the 11mph
+    example above) does not by itself mean the plan is realistic."""
     dest_lat, dest_lon = plan_row["dest_lat"], plan_row["dest_lon"]
     eta_end = plan_row["eta_end"]
     is_overdue = False
@@ -335,10 +377,51 @@ def _compute_plan_status(uuid: str, plan_row, current_lat=None, current_lon=None
         current_distance_miles is not None and closest_approach_miles is not None
         and current_distance_miles > closest_approach_miles + _PROGRESS_TREND_THRESHOLD_MILES
     )
-    status = "overdue" if is_overdue else ("moving_away" if is_moving_away else "on_track")
+
+    is_stalled = False
+    if (
+        not is_moving_away and current_distance_miles is not None and closest_approach_miles is not None
+        and current_distance_miles > plan_row["radius_miles"]  # not yet arrived
+    ):
+        recent_cutoff = (datetime.now(timezone.utc) - timedelta(days=_STALL_MIN_DAYS_SINCE_PROGRESS)).strftime("%Y-%m-%d %H:%M:%S")
+        with sqlite3.connect(DB_PATH) as con:
+            early_rows = con.execute(
+                "SELECT lat, lon FROM observations WHERE uuid = ? AND obs_time >= ? AND obs_time < ?",
+                (uuid, plan_row["start_date"], recent_cutoff),
+            ).fetchall()
+        if early_rows:
+            # closest_approach_miles already covers the FULL window since
+            # start_date; this covers everything EXCEPT the last
+            # _STALL_MIN_DAYS_SINCE_PROGRESS days — if the two are
+            # (near-)equal, nothing in the recent window beat what was
+            # already achieved earlier, i.e. no real progress lately.
+            earliest_closest_miles = min(
+                _haversine_meters(r[0], r[1], dest_lat, dest_lon) / _METERS_PER_MILE for r in early_rows
+            )
+            is_stalled = closest_approach_miles >= earliest_closest_miles - _STALL_PROGRESS_FLOOR_MILES
+
+    required_avg_speed_mph = None
+    eta_end_date = None
+    if eta_end and not is_overdue and current_distance_miles is not None:
+        try:
+            eta_end_date = datetime.strptime(eta_end, "%Y-%m-%d") + timedelta(days=1)  # exclusive end-of-day
+        except ValueError:
+            eta_end_date = None
+        if eta_end_date:
+            hours_remaining = (eta_end_date - datetime.now(timezone.utc).replace(tzinfo=None)).total_seconds() / 3600
+            if hours_remaining > 0:
+                required_avg_speed_mph = round(current_distance_miles / hours_remaining, 1)
+
+    status = (
+        "overdue" if is_overdue else
+        "moving_away" if is_moving_away else
+        "stalled" if is_stalled else
+        "on_track"
+    )
     return {
-        "status": status, "is_overdue": is_overdue, "is_moving_away": is_moving_away,
+        "status": status, "is_overdue": is_overdue, "is_moving_away": is_moving_away, "is_stalled": is_stalled,
         "current_distance_miles": current_distance_miles, "closest_approach_miles": closest_approach_miles,
+        "required_avg_speed_mph": required_avg_speed_mph,
     }
 
 
@@ -593,6 +676,19 @@ def init_db():
             # which is the closest honest approximation available.
             con.execute("ALTER TABLE device_plans ADD COLUMN start_date TEXT")
             con.execute("UPDATE device_plans SET start_date = date(created_at) WHERE start_date IS NULL")
+        if "last_monitored_status" not in existing_plan_cols:
+            # Bookkeeping for the scheduled plan-monitor thread only (see
+            # _plan_monitor_cycle()) — last_monitored_status lets it detect a
+            # STATUS TRANSITION (only assess on_track -> stalled, not every
+            # poll while already stalled); last_assessed_at backs a cooldown
+            # re-assessment (PLAN_MONITOR_REASSESS_HOURS) so a long-running
+            # incident doesn't go stale either. Both reset to NULL on every
+            # plan create/update (see set_device_plan()) — otherwise a reused
+            # device would inherit stale tracking state from a prior
+            # assignment, the same device-reuse pitfall start_date itself was
+            # added to fix.
+            con.execute("ALTER TABLE device_plans ADD COLUMN last_monitored_status TEXT")
+            con.execute("ALTER TABLE device_plans ADD COLUMN last_assessed_at TEXT")
         # A basic history of every create/update/delete of a plan — unlike
         # audit_log (which deliberately never logs dest_lat/dest_lon, since
         # that log has no per-device visibility filter and any admin can
@@ -631,6 +727,24 @@ def init_db():
             # Tracking design decision, now actually distinguishable in the
             # history it writes to instead of being generically "deleted."
             con.execute("ALTER TABLE device_plan_history ADD COLUMN outcome TEXT")
+        # Goby's generated narration for a plan currently overdue/moving_away/
+        # stalled — one row per assessment (not per device/plan, like
+        # device_plan_history), so an incident's assessments over time are all
+        # kept, not just the latest. Written by _generate_plan_assessment()
+        # (called from the scheduled monitor thread OR the manual "assess now"
+        # button, both going through the same function). Read-gated by
+        # _device_visible(uuid), same as device_plan_history, since the
+        # narration can reference the real destination.
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS plan_assessments (
+                id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                uuid                 TEXT NOT NULL,
+                status_at_assessment TEXT NOT NULL,
+                assessment_text      TEXT NOT NULL,
+                created_at           TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        con.execute("CREATE INDEX IF NOT EXISTS idx_plan_assessments_uuid ON plan_assessments(uuid, created_at)")
         # One-time backfill: the old single free-text device_meta.notes field
         # becomes an initial public label per device that had one. Guarded by
         # an app_settings flag (not "does device_labels have rows", which
@@ -1343,7 +1457,8 @@ def set_device_plan(uuid):
                 dest_lat = excluded.dest_lat, dest_lon = excluded.dest_lon,
                 radius_miles = excluded.radius_miles, eta_start = excluded.eta_start,
                 eta_end = excluded.eta_end, start_date = excluded.start_date,
-                created_by = excluded.created_by, updated_at = datetime('now')
+                created_by = excluded.created_by, updated_at = datetime('now'),
+                last_monitored_status = NULL, last_assessed_at = NULL
         """, (uuid, dest_lat, dest_lon, radius_miles, eta_start, eta_end, start_date, session["user_id"]))
         # Unlike audit_log (see below), this table's read route is gated by
         # _device_visible() same as the live plan, so the real destination
@@ -1417,6 +1532,76 @@ def get_device_plan_history(uuid):
             WHERE h.uuid = ? ORDER BY h.changed_at DESC
         """, (uuid,)).fetchall()
     return jsonify([dict(r) for r in rows])
+
+
+@app.route("/api/devices/<uuid>/plan/assessments")
+@login_required
+def get_device_plan_assessments(uuid):
+    """Goby's generated narration for this device's plan, newest first — same
+    visibility rule as the live plan and its history (_device_visible()), not
+    a separate tier. Written either by the scheduled monitor thread or the
+    manual 'assess now' button below; both share _generate_plan_assessment(),
+    so there's nothing here distinguishing which path produced a given row."""
+    if not _device_visible(uuid):
+        return jsonify({"error": "not found"}), 404
+    limit = min(int(request.args.get("limit") or 10), 50)
+    with sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            "SELECT status_at_assessment, assessment_text, created_at FROM plan_assessments "
+            "WHERE uuid = ? ORDER BY created_at DESC LIMIT ?", (uuid, limit),
+        ).fetchall()
+    return jsonify([dict(r) for r in rows])
+
+
+# Manual, per-device/per-plan trigger — deliberately scoped to ONE device at
+# a time (not a fleet-wide "assess everything now" action), matching how
+# every other Smart Tracking action in this app already works one device at
+# a time. Shares _generate_plan_assessment()/_store_plan_assessment() with
+# the scheduled monitor thread, so a manual request and a scheduled one
+# produce identically-shaped plan_assessments rows — nothing distinguishes
+# them other than which call site inserted the row.
+@app.route("/api/devices/<uuid>/plan/assess", methods=["POST"])
+@login_required
+def assess_device_plan(uuid):
+    if not _device_visible(uuid):
+        return jsonify({"error": "not found"}), 404
+    if not _ai_feature_enabled():
+        return jsonify({"error": "Goby is not available right now"}), 503
+    if not _user_ai_allowed(session["user_id"]):
+        return jsonify({"error": "Goby has been disabled for your account"}), 403
+    with sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        plan = con.execute("SELECT * FROM device_plans WHERE uuid = ?", (uuid,)).fetchone()
+    if not plan:
+        return jsonify({"error": "this device has no active plan"}), 400
+    if not _AI_SEMAPHORE.acquire(blocking=False):
+        return jsonify({"error": "Goby is busy, try again shortly"}), 429
+    try:
+        status = _compute_plan_status(uuid, plan)["status"]
+        text = _generate_plan_assessment(uuid)
+    except requests.exceptions.Timeout:
+        return jsonify({"error": "Goby took too long to respond — try again in a moment."}), 504
+    except requests.exceptions.ConnectionError:
+        return jsonify({"error": "Could not reach Goby — check the LLM backend."}), 502
+    except Exception:
+        logging.exception("Manual plan assessment failed for %s", uuid)
+        return jsonify({"error": "Goby hit an unexpected error. Please try again."}), 500
+    finally:
+        _AI_SEMAPHORE.release()
+    created_at = _store_plan_assessment(uuid, status, text)
+    # A manual assessment also counts as "handled" for the scheduled
+    # monitor's own transition/cooldown tracking — otherwise the next
+    # scheduled cycle would immediately re-assess the exact same status this
+    # request just covered.
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute(
+            "UPDATE device_plans SET last_monitored_status = ?, last_assessed_at = ? WHERE uuid = ?",
+            (status, created_at, uuid),
+        )
+        con.commit()
+    log_activity("plan.assessment", target=uuid, detail=f"status={status} manual=true")
+    return jsonify({"status_at_assessment": status, "assessment_text": text, "created_at": created_at})
 
 
 @app.route("/api/devices")
@@ -1798,6 +1983,230 @@ def _nearest_place(lat, lon):
         "country": country,
         "distance_miles": distance_miles,
     }
+
+
+def _latest_plan_assessment(uuid: str) -> dict | None:
+    """The most recent Goby-generated assessment for one device's plan, or
+    None — read helper shared by _tool_get_plan_status() (so a chat question
+    can reference prior context) and the GET assessments route below."""
+    with sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        row = con.execute(
+            "SELECT status_at_assessment, assessment_text, created_at FROM plan_assessments "
+            "WHERE uuid = ? ORDER BY created_at DESC LIMIT 1", (uuid,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def _log_system_activity(action: str, target: str | None = None, detail: str | None = None):
+    """log_activity()'s equivalent for code with no Flask request context —
+    same direct-INSERT pattern as _stamp_version(), username='system', since
+    the scheduled plan-monitor thread runs outside any request/session."""
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute(
+            "INSERT INTO audit_log (user_id, username, action, target, detail, ip) "
+            "VALUES (NULL, 'system', ?, ?, ?, NULL)",
+            (action, target, detail),
+        )
+        con.commit()
+
+
+def _plan_monitor_enabled() -> bool:
+    """Scheduled plan-assessment monitoring — gated on BOTH its own runtime
+    toggle (app_settings.plan_monitor_enabled, super admin only via PATCH
+    /api/admin/ai-settings, default OFF since this is new — same
+    new-flags-default-off convention as users.ai_access for a new account)
+    AND Ask Goby being enabled at all (_ai_feature_enabled()). Turning Goby
+    off globally must also stop every background task that calls it, not
+    just the chat panel — checked at the TOP of every monitor cycle, not
+    just once at thread start, so flipping either toggle off takes effect on
+    the very next cycle rather than requiring a restart."""
+    if not _ai_feature_enabled():
+        return False
+    with sqlite3.connect(DB_PATH) as con:
+        row = con.execute("SELECT value FROM app_settings WHERE key = 'plan_monitor_enabled'").fetchone()
+    return row is not None and row[0] == "1"
+
+
+def _generate_plan_assessment(uuid: str) -> str:
+    """Builds one focused Goby assessment of a single device's ACTIVE plan —
+    used by both the scheduled monitor thread and the manual per-device
+    "assess now" button, so there's exactly one code path to maintain.
+
+    Deliberately does NOT go through the general _llm_chat_with_tools()
+    tool-calling loop: unlike an open-ended Ask Goby question, this already
+    knows exactly what's relevant (the plan, its deterministically-computed
+    status, and the device's own facts) — there's nothing for the model to
+    decide to look up, and the tool-calling tools themselves are RBAC-gated
+    through session-dependent helpers (_visible_devices(), etc.) that don't
+    exist when this runs from the background thread with no Flask request
+    context at all. Visibility for who may READ the result lives on the
+    routes that serve plan_assessments (_device_visible(uuid), same as
+    device_plan_history), not here — this function itself operates on one
+    already-identified uuid with no session.
+
+    Raises ValueError if the device/plan can't be found (e.g. a plan was
+    deleted between being queued and assessed)."""
+    with sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        device = con.execute(
+            "SELECT uuid, name, lat, lon FROM observations WHERE uuid = ? ORDER BY obs_time DESC LIMIT 1", (uuid,)
+        ).fetchone()
+        plan = con.execute("SELECT * FROM device_plans WHERE uuid = ?", (uuid,)).fetchone()
+    if not device or not plan:
+        raise ValueError(f"no active plan found for device {uuid}")
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    today_str = now.strftime("%Y-%m-%d")
+
+    def _days_until(date_str):
+        """Positive = in the future, negative = already passed, None if unset/unparseable."""
+        if not date_str:
+            return None
+        try:
+            return round((datetime.strptime(date_str, "%Y-%m-%d") - now).total_seconds() / 86400, 1)
+        except ValueError:
+            return None
+
+    days_until_start_date = _days_until(plan["start_date"])
+    facts = {
+        "device_name": device["name"],
+        "destination_near": _nearest_place(plan["dest_lat"], plan["dest_lon"]),
+        "destination_radius_miles": plan["radius_miles"],
+        "start_date": plan["start_date"], "eta_start": plan["eta_start"], "eta_end": plan["eta_end"],
+        "days_since_plan_start": -days_until_start_date if days_until_start_date is not None else None,
+        "days_until_eta_start": _days_until(plan["eta_start"]),
+        "days_until_eta_end": _days_until(plan["eta_end"]),
+        "current_speed_mph": _device_current_speed(uuid).get("current_speed_mph"),
+        **_compute_plan_status(uuid, plan, device["lat"], device["lon"]),
+    }
+    system_msg = {
+        "role": "system",
+        "content": (
+            f"Today's date is {today_str} (UTC). You are assessing ONE device's Smart Tracking "
+            "plan for a BLE tracking dashboard. You are given the plan's complete, already-"
+            "computed facts below as JSON — never invent anything beyond them, and never state "
+            "raw GPS coordinates (none are given to you; 'destination_near' is the only location "
+            "context, an approximate place name plus distance). Write a thorough but still compact "
+            "assessment (roughly 6-10 sentences, a short paragraph or two of plain prose — NOT "
+            "markdown, no tables, no bullet lists, this renders as plain text in a small panel) of "
+            "whether this device looks on track to reach its destination within its ETA window. "
+            "Ground every claim ONLY in these facts, and actively cite the specific numbers rather "
+            "than vague language: the distance remaining, days_since_plan_start, days_until_eta_start/"
+            "days_until_eta_end (a negative days_until value means that date has already passed), "
+            "required_avg_speed_mph (the sustained speed still needed to make the ETA), and "
+            "current_speed_mph (how fast it's moving right now, for comparison against that required "
+            "speed) — walk through what these numbers imply together, the way a knowledgeable analyst "
+            "would, not just a bare status label. If status is 'stalled' or 'moving_away', say "
+            "plainly why using the facts (e.g. no progress in several days, or actively moving "
+            "farther away) — a plausible-looking required_avg_speed_mph does NOT by itself mean the "
+            "plan is realistic, so don't let a low required speed override a 'stalled'/'moving_away' "
+            "status; say so explicitly if the two seem to conflict. If 'on_track', still cite the key "
+            "numbers rather than a bare confirmation. Whenever you state a place, use "
+            "destination_near's 'label' field verbatim and in full, never shortened."
+            "\n\nFacts:\n" + json.dumps(facts, default=str)
+        ),
+    }
+    choice = _llm_chat_once([system_msg, {"role": "user", "content": "Assess this plan."}])
+    return (choice.get("message") or {}).get("content") or ""
+
+
+def _store_plan_assessment(uuid: str, status: str, text: str) -> str:
+    """Inserts one assessment row and returns its created_at timestamp (UTC,
+    'YYYY-MM-DD HH:MM:SS') — computed here in Python rather than left to
+    SQLite's own `datetime('now')` column default, so the manual assess route
+    can hand the browser a real timestamp instead of a vague 'just now'."""
+    created_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute(
+            "INSERT INTO plan_assessments (uuid, status_at_assessment, assessment_text, created_at) VALUES (?, ?, ?, ?)",
+            (uuid, status, text, created_at),
+        )
+        con.commit()
+    return created_at
+
+
+def _plan_monitor_cycle():
+    """One pass over every plan in the system (not RBAC-filtered — same
+    system-wide scope as _prune_audit_log(), since this is a background
+    process, not a user session). For each plan currently in a 'bad' status
+    (overdue/moving_away/stalled), triggers a fresh Goby assessment on a
+    STATUS TRANSITION (newly entering that status) or once the existing
+    assessment is older than PLAN_MONITOR_REASSESS_HOURS — never every
+    single cycle for an unchanged, already-known incident, which would just
+    burn LLM calls re-stating the same thing. on_track plans are never
+    assessed. Each LLM call runs through _AI_SEMAPHORE like any other, and
+    serially (one device at a time, never concurrent) so this background
+    job can never compete with live chat/SSE traffic for threads."""
+    if not _plan_monitor_enabled():
+        return
+    with sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        plans = con.execute("SELECT * FROM device_plans").fetchall()
+    for plan in plans:
+        uuid = plan["uuid"]
+        try:
+            status = _compute_plan_status(uuid, plan)["status"]
+        except Exception:
+            logging.exception("Plan monitor: status computation failed for %s", uuid)
+            continue
+        needs_assessment = False
+        if status != "on_track":
+            if status != plan["last_monitored_status"]:
+                needs_assessment = True
+            elif not plan["last_assessed_at"]:
+                needs_assessment = True
+            else:
+                try:
+                    last_assessed = datetime.strptime(plan["last_assessed_at"], "%Y-%m-%d %H:%M:%S")
+                    hours_since = (datetime.now(timezone.utc).replace(tzinfo=None) - last_assessed).total_seconds() / 3600
+                    needs_assessment = hours_since >= PLAN_MONITOR_REASSESS_HOURS
+                except ValueError:
+                    needs_assessment = True
+        assessment_failed = False
+        if needs_assessment:
+            if not _AI_SEMAPHORE.acquire(blocking=True, timeout=30):
+                logging.warning("Plan monitor: LLM busy, skipping %s this cycle", uuid)
+                assessment_failed = True
+            else:
+                try:
+                    text = _generate_plan_assessment(uuid)
+                    _store_plan_assessment(uuid, status, text)
+                    _log_system_activity("plan.assessment", target=uuid, detail=f"status={status}")
+                except Exception:
+                    logging.exception("Plan monitor: assessment failed for %s", uuid)
+                    assessment_failed = True
+                finally:
+                    _AI_SEMAPHORE.release()
+        if assessment_failed:
+            # Leave last_monitored_status/last_assessed_at exactly as they
+            # were — if last_monitored_status still differs from the real
+            # current status, next cycle's transition check fires again and
+            # retries, rather than the row silently recording this cycle as
+            # "handled" when it wasn't (which could otherwise hide a real
+            # failure for up to PLAN_MONITOR_REASSESS_HOURS).
+            continue
+        with sqlite3.connect(DB_PATH) as con:
+            con.execute(
+                "UPDATE device_plans SET last_monitored_status = ?, "
+                "last_assessed_at = CASE WHEN ? THEN datetime('now') ELSE last_assessed_at END "
+                "WHERE uuid = ?",
+                (status, 1 if needs_assessment else 0, uuid),
+            )
+            con.commit()
+
+
+def _plan_monitor_loop():
+    """Runs _plan_monitor_cycle() immediately, then every
+    PLAN_MONITOR_INTERVAL_SECONDS for the life of the process — same
+    daemon-thread pattern as _audit_log_pruner()/_ai_history_pruner(). Each
+    cycle re-checks _plan_monitor_enabled() itself, so toggling either gate
+    off takes effect on the next cycle, not just at thread start."""
+    while True:
+        try:
+            _plan_monitor_cycle()
+        except Exception:
+            logging.exception("Plan monitor cycle failed")
+        time.sleep(PLAN_MONITOR_INTERVAL_SECONDS)
 
 
 def _resolve_place(name: str, country: str | None = None):
@@ -2594,7 +3003,7 @@ def _tool_get_plan_status(args: dict) -> dict:
         """, (d["uuid"],)).fetchone()
     if not row:
         return {"name": d["name"], "uuid": d["uuid"], "has_plan": False}
-    return {
+    result = {
         "name": d["name"], "uuid": d["uuid"], "has_plan": True,
         "destination_radius_miles": row["radius_miles"],
         "destination_near": _nearest_place(row["dest_lat"], row["dest_lon"]),
@@ -2603,6 +3012,10 @@ def _tool_get_plan_status(args: dict) -> dict:
         "declared_by": row["created_by_username"],
         "declared_at": row["created_at"], "last_updated_at": row["updated_at"],
     }
+    latest = _latest_plan_assessment(d["uuid"])
+    if latest:
+        result["latest_assessment"] = latest
+    return result
 
 
 def _tool_get_plan_history(args: dict) -> dict:
@@ -2733,24 +3146,29 @@ def _tool_get_reporting_gaps(args: dict) -> dict:
             "largest_gaps": gaps[:limit]}
 
 
+_PLAN_ALERT_SORT_ORDER = {"overdue": 0, "moving_away": 1, "stalled": 2}
+
+
 def _tool_get_plan_alerts(args: dict) -> dict:
     """Fleet-wide Smart Tracking alerts — every visible device whose
-    plan_status is 'overdue' or 'moving_away', mirroring the dashboard's own
-    topbar alerts bell (see CLAUDE.md's Smart Tracking stage 3) so 'which
-    devices need attention' doesn't require the model to call list_devices
-    and then reason about plan_status itself across every entry. Reuses
-    get_plan_status's own per-device output (destination/ETA/distance
-    detail) rather than duplicating its logic, same pattern get_device_status
-    already uses for the same tool. Overdue sorts first, same priority
-    _compute_plan_status() itself uses when a device is somehow both."""
+    plan_status is 'overdue', 'moving_away', or 'stalled' (on_track is never
+    included), mirroring the dashboard's own topbar alerts bell (see
+    CLAUDE.md's Smart Tracking stage 3) so 'which devices need attention'
+    doesn't require the model to call list_devices and then reason about
+    plan_status itself across every entry. Reuses get_plan_status's own
+    per-device output (destination/ETA/distance detail) rather than
+    duplicating its logic, same pattern get_device_status already uses for
+    the same tool. Sorted overdue, then moving_away, then stalled — same
+    priority _compute_plan_status() itself uses when a device is somehow
+    more than one at once."""
     devices = _visible_devices()
     alerts = []
     for d in devices:
-        if d["plan_status"] in ("overdue", "moving_away"):
+        if d["plan_status"] in _PLAN_ALERT_SORT_ORDER:
             status = _tool_get_plan_status({"device": d["uuid"]})
             status["group"] = d["group_name"]
             alerts.append(status)
-    alerts.sort(key=lambda a: 0 if a["status"] == "overdue" else 1)
+    alerts.sort(key=lambda a: _PLAN_ALERT_SORT_ORDER.get(a["status"], 99))
     return {"alert_count": len(alerts), "alerts": alerts}
 
 
@@ -2892,7 +3310,7 @@ _AI_TOOL_DISPATCH = {
 _AI_TOOLS = [
     {"type": "function", "function": {
         "name": "list_devices",
-        "description": "List every device visible to the current user, with group, fix count, last-seen time, approximate location, cadence/staleness, average confidence/accuracy (plus a recent-30-days-vs-all-time confidence_trend/accuracy_trend of 'improving'/'worsening'/'stable' — note accuracy is a GPS error RADIUS IN METERS so 'improving' means the number got SMALLER, the opposite of confidence), current_speed_mph (instantaneous rate between the two most recent fixes, not a window average), distance traveled over a given window (plus a combined fleet total), and plan_status ('on_track'/'overdue'/'moving_away', or null if the device has no Smart Tracking plan). plan_status alone is already enough for 'which devices are overdue/on track/moving away' — only call get_plan_status for a device's actual destination/ETA detail, or get_plan_alerts for the fleet-wide list of only the ones needing attention. Also includes a top-level devices_by_country count (each device's CURRENT country only, from its latest position — for a device's country history over time use get_country_history instead; for 'which devices are near <place>' use find_devices_near_place instead, which works off a named place rather than a country name). A device with an active plan never counts distance OR fix_count from before that plan's start_date, even if the requested window reaches further back — when this clamp actually narrows a device's own window below the one you asked for, that device's entry carries its own 'distance_window' and/or 'fix_count_window' field overriding the defaults; state that device's distance/fix count using its own window field, not the fleet-wide one.",
+        "description": "List every device visible to the current user, with group, fix count, last-seen time, approximate location, cadence/staleness, average confidence/accuracy (plus a recent-30-days-vs-all-time confidence_trend/accuracy_trend of 'improving'/'worsening'/'stable' — note accuracy is a GPS error RADIUS IN METERS so 'improving' means the number got SMALLER, the opposite of confidence), current_speed_mph (instantaneous rate between the two most recent fixes, not a window average), distance traveled over a given window (plus a combined fleet total), and plan_status ('on_track'/'overdue'/'moving_away'/'stalled', or null if the device has no Smart Tracking plan — 'stalled' means it hasn't made real progress toward its destination in a few days, which is different from 'moving_away', actively getting farther). plan_status alone is already enough for 'which devices are overdue/on track/moving away/stalled' — only call get_plan_status for a device's actual destination/ETA detail, or get_plan_alerts for the fleet-wide list of only the ones needing attention. Also includes a top-level devices_by_country count (each device's CURRENT country only, from its latest position — for a device's country history over time use get_country_history instead; for 'which devices are near <place>' use find_devices_near_place instead, which works off a named place rather than a country name). A device with an active plan never counts distance OR fix_count from before that plan's start_date, even if the requested window reaches further back — when this clamp actually narrows a device's own window below the one you asked for, that device's entry carries its own 'distance_window' and/or 'fix_count_window' field overriding the defaults; state that device's distance/fix count using its own window field, not the fleet-wide one.",
         "parameters": {"type": "object", "properties": {
             "days": {"type": "integer", "description": "How many days back to compute distance traveled over. Default 30 if omitted. Pass 0 for all-time."},
         }},
@@ -2927,7 +3345,7 @@ _AI_TOOLS = [
         "parameters": {"type": "object", "properties": {
             "limit": {"type": "integer", "description": "Max rows to return, default 50, capped at 500"},
             "username": {"type": "string", "description": "Optional — a person's display name or username to filter to, e.g. 'Tho Pham' or 'tpham'"},
-            "action": {"type": "string", "description": "Optional — exact action type to filter to. Use 'login' for login-history questions. Every other real value this system logs: logout, login_failed, password_change, user.create, user.update, user.password_reset, user.delete, group.create, group.update, group.delete, group_code.create, group_code.delete, device.archive, device.unarchive, device.access_update, device.export, device.backup, device.delete, plan.create, plan.update, plan.delete, label.create, label.update, label.delete, ai.ask, ai.tool_call, ai.enabled_toggle, ai.history_clear, schema_version.change, app_version.change."},
+            "action": {"type": "string", "description": "Optional — exact action type to filter to. Use 'login' for login-history questions. Every other real value this system logs: logout, login_failed, password_change, user.create, user.update, user.password_reset, user.delete, group.create, group.update, group.delete, group_code.create, group_code.delete, device.archive, device.unarchive, device.access_update, device.export, device.backup, device.delete, plan.create, plan.update, plan.delete, plan.assessment, label.create, label.update, label.delete, ai.ask, ai.tool_call, ai.enabled_toggle, ai.plan_monitor_toggle, ai.history_clear, schema_version.change, app_version.change."},
             "start_date": {"type": "string", "description": "Optional — YYYY-MM-DD, inclusive start of the date range"},
             "end_date": {"type": "string", "description": "Optional — YYYY-MM-DD, inclusive end of the date range"},
         }},
@@ -2942,7 +3360,7 @@ _AI_TOOLS = [
     }},
     {"type": "function", "function": {
         "name": "get_plan_status",
-        "description": "A device's declared Smart Tracking plan, if any — its destination (as an approximate place + proximity radius, never exact coordinates), start_date (when the plan began), ETA window, and computed status. Use for any question about a device's plan, destination, when its plan started, where it's headed, when it's expected, or whether it's on track/overdue/moving away. has_plan is false if no plan was ever declared for this device — say so plainly, don't treat that as an error. The 'status' field ('on_track'/'overdue'/'moving_away') plus 'is_overdue'/'is_moving_away' are already fully computed — always use these directly, never compute your own overdue/on-track judgment from eta_start/eta_end and today's date, and never describe a status this tool didn't return (e.g. don't say 'moving away' unless is_moving_away is true).",
+        "description": "A device's declared Smart Tracking plan, if any — its destination (as an approximate place + proximity radius, never exact coordinates), start_date (when the plan began), ETA window, and computed status. Use for any question about a device's plan, destination, when its plan started, where it's headed, when it's expected, or whether it's on track/overdue/moving away/stalled — including 'will it arrive on time' predictions, which must be grounded in these fields, never your own judgment of raw dates/positions. has_plan is false if no plan was ever declared for this device — say so plainly, don't treat that as an error. The 'status' field ('on_track'/'overdue'/'moving_away'/'stalled') plus 'is_overdue'/'is_moving_away'/'is_stalled' are already fully computed — always use these directly, never compute your own overdue/on-track judgment from eta_start/eta_end and today's date, and never describe a status this tool didn't return (e.g. don't say 'moving away' unless is_moving_away is true). 'stalled' means the closest-ever approach to the destination hasn't improved in at least a couple of days — weaker than 'moving_away' (which means it's actively regressed), but still a real concern worth surfacing. 'required_avg_speed_mph' (null once overdue, since there's no time left to compute it against) is the sustained, zero-stop speed needed to reach the destination by the ETA window's end — quote it when discussing feasibility, but a plausible-looking number alone does NOT mean the plan is realistic (e.g. an intercontinental trip needing only ~11mph sustained is still unrealistic if the device hasn't moved at all) — weigh it together with status/is_stalled/is_moving_away, never in isolation. If 'latest_assessment' is present, it's Goby's own most recent generated assessment of this exact plan (from the scheduled monitor or a manual request) — you may reference it as prior context, but still ground any NEW answer in the current status fields, since the device may have moved since that assessment was written.",
         "parameters": {"type": "object", "properties": {
             "device": {"type": "string", "description": "Device name or UUID"},
         }, "required": ["device"]},
@@ -2957,7 +3375,7 @@ _AI_TOOLS = [
     }},
     {"type": "function", "function": {
         "name": "get_plan_alerts",
-        "description": "Every visible device whose Smart Tracking plan status is currently 'overdue' or 'moving_away' (on_track devices are never included) — the fleet-wide version of plan_status, for 'which devices need attention/are overdue/are moving away' without having to call list_devices and check every device's plan_status yourself. Each alert is the full get_plan_status detail for that device (destination, ETA, distances) plus its group. Overdue entries come first.",
+        "description": "Every visible device whose Smart Tracking plan status is currently 'overdue', 'moving_away', or 'stalled' (on_track devices are never included) — the fleet-wide version of plan_status, for 'which devices need attention/are overdue/are moving away/are stalled' without having to call list_devices and check every device's plan_status yourself. Each alert is the full get_plan_status detail for that device (destination, ETA, distances) plus its group. Sorted overdue first, then moving_away, then stalled.",
         "parameters": {"type": "object", "properties": {}},
     }},
     {"type": "function", "function": {
@@ -3135,11 +3553,21 @@ def ai_history():
         # Fixed with the standard "most recent N, re-sorted oldest-first for
         # display" pattern — take the latest N by DESC+LIMIT in a subquery,
         # then re-sort that smaller set ASC for chronological display order.
+        #
+        # `id` (autoincrement, so always insertion-ordered) is a required
+        # SECONDARY sort key on both the inner and outer ORDER BY —
+        # created_at alone has only 1-second resolution, and a question +
+        # its answer are inserted back-to-back in the same request, so they
+        # routinely land on the IDENTICAL timestamp. Confirmed live: without
+        # `id`, that tie let the inner DESC LIMIT return the pair
+        # answer-before-question, and the outer ASC re-sort couldn't fix it
+        # either, since created_at was equal there too — reopening the panel
+        # showed a real response rendered above the question it answered.
         rows = con.execute("""
             SELECT role, content, created_at FROM (
-                SELECT role, content, created_at FROM ai_messages
-                WHERE user_id = ? ORDER BY created_at DESC LIMIT ?
-            ) ORDER BY created_at ASC
+                SELECT id, role, content, created_at FROM ai_messages
+                WHERE user_id = ? ORDER BY created_at DESC, id DESC LIMIT ?
+            ) ORDER BY created_at ASC, id ASC
         """, (session["user_id"], limit)).fetchall()
     return jsonify([dict(r) for r in rows])
 
@@ -3673,7 +4101,15 @@ def admin_get_ai_settings():
         return jsonify({"error": "super admin privileges required"}), 403
     with sqlite3.connect(DB_PATH) as con:
         row = con.execute("SELECT value FROM app_settings WHERE key = 'ai_enabled'").fetchone()
-    return jsonify({"configured": _llm_configured(), "enabled": row is None or row[0] == "1"})
+        plan_row = con.execute("SELECT value FROM app_settings WHERE key = 'plan_monitor_enabled'").fetchone()
+    return jsonify({
+        "configured": _llm_configured(), "enabled": row is None or row[0] == "1",
+        # Default OFF (unlike "enabled" above, which defaults ON) — this is a
+        # brand-new scheduled background feature with real LLM cost
+        # implications, so it must be deliberately opted into, same
+        # new-flags-default-off convention as users.ai_access.
+        "plan_monitor_enabled": plan_row is not None and plan_row[0] == "1",
+    })
 
 
 @app.route("/api/admin/ai-settings", methods=["PATCH"])
@@ -3682,17 +4118,40 @@ def admin_set_ai_settings():
     if not session.get("is_super_admin"):
         return jsonify({"error": "super admin privileges required"}), 403
     data = request.get_json(force=True, silent=True) or {}
-    if "enabled" not in data:
-        return jsonify({"error": "enabled is required"}), 400
-    enabled = bool(data["enabled"])
+    if "enabled" not in data and "plan_monitor_enabled" not in data:
+        return jsonify({"error": "enabled or plan_monitor_enabled is required"}), 400
+    # log_activity() opens its OWN sqlite3 connection and commits — calling it
+    # while THIS block's own write transaction is still open deadlocked live
+    # ("database is locked"), since SQLite serializes writers. Both toggles'
+    # log_activity() calls are deferred until after this `with` block fully
+    # closes (committing first), same as every other route in this file
+    # already does it; only the two boolean values are carried out.
+    enabled = plan_monitor_enabled = None
     with sqlite3.connect(DB_PATH) as con:
-        con.execute("""
-            INSERT INTO app_settings (key, value) VALUES ('ai_enabled', ?)
-            ON CONFLICT(key) DO UPDATE SET value = excluded.value
-        """, ("1" if enabled else "0",))
+        if "enabled" in data:
+            enabled = bool(data["enabled"])
+            con.execute("""
+                INSERT INTO app_settings (key, value) VALUES ('ai_enabled', ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """, ("1" if enabled else "0",))
+        if "plan_monitor_enabled" in data:
+            plan_monitor_enabled = bool(data["plan_monitor_enabled"])
+            con.execute("""
+                INSERT INTO app_settings (key, value) VALUES ('plan_monitor_enabled', ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """, ("1" if plan_monitor_enabled else "0",))
         con.commit()
-    log_activity("ai.enabled_toggle", detail=f"enabled={enabled}")
-    return jsonify({"ok": True, "enabled": enabled})
+    if enabled is not None:
+        log_activity("ai.enabled_toggle", detail=f"enabled={enabled}")
+    if plan_monitor_enabled is not None:
+        log_activity("ai.plan_monitor_toggle", detail=f"enabled={plan_monitor_enabled}")
+    with sqlite3.connect(DB_PATH) as con:
+        row = con.execute("SELECT value FROM app_settings WHERE key = 'ai_enabled'").fetchone()
+        plan_row = con.execute("SELECT value FROM app_settings WHERE key = 'plan_monitor_enabled'").fetchone()
+    return jsonify({
+        "ok": True, "enabled": row is None or row[0] == "1",
+        "plan_monitor_enabled": plan_row is not None and plan_row[0] == "1",
+    })
 
 
 def _device_backup_payload(uuid: str) -> dict:
@@ -3729,6 +4188,10 @@ def _device_backup_payload(uuid: str) -> dict:
             FROM device_plan_history h LEFT JOIN users u ON u.id = h.changed_by
             WHERE h.uuid = ? ORDER BY h.changed_at
         """, (uuid,)).fetchall()
+        plan_assessments = con.execute(
+            "SELECT status_at_assessment, assessment_text, created_at FROM plan_assessments "
+            "WHERE uuid = ? ORDER BY created_at", (uuid,),
+        ).fetchall()
     return {
         "uuid": uuid,
         "backed_up_at": datetime.now(timezone.utc).isoformat(),
@@ -3741,6 +4204,7 @@ def _device_backup_payload(uuid: str) -> dict:
         } for l in labels],
         "plan": dict(plan) if plan else None,
         "plan_history": [dict(r) for r in plan_history],
+        "plan_assessments": [dict(r) for r in plan_assessments],
     }
 
 
@@ -3805,6 +4269,7 @@ def delete_device_permanently(uuid):
         con.execute("DELETE FROM device_labels WHERE uuid = ?", (uuid,))
         con.execute("DELETE FROM device_plans WHERE uuid = ?", (uuid,))
         con.execute("DELETE FROM device_plan_history WHERE uuid = ?", (uuid,))
+        con.execute("DELETE FROM plan_assessments WHERE uuid = ?", (uuid,))
         con.commit()
     log_activity("device.delete", target=uuid)
     return jsonify({"uuid": uuid, "deleted": True})
@@ -3815,6 +4280,7 @@ bootstrap_admin()
 threading.Thread(target=tcp_listener, daemon=True).start()
 threading.Thread(target=_audit_log_pruner, daemon=True).start()
 threading.Thread(target=_ai_history_pruner, daemon=True).start()
+threading.Thread(target=_plan_monitor_loop, daemon=True).start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=HTTP_PORT, threaded=True)

@@ -233,6 +233,7 @@ html, body { height: 100%; font-family: 'Segoe UI', sans-serif; background: #0d1
 .plan-chip.on_track    { color: #3fb950; border-color: #3fb950; background: #0d2b1a; }
 .plan-chip.overdue     { color: #f85149; border-color: #f85149; background: #2b0d0d; }
 .plan-chip.moving_away { color: #e3b341; border-color: #e3b341; background: #2b2000; }
+.plan-chip.stalled     { color: #a371f7; border-color: #a371f7; background: #1f0d2b; }
 .card-archive {
   margin-left: auto; flex-shrink: 0; width: 22px; height: 22px;
   background: none; border: 1px solid #30363d; border-radius: 3px;
@@ -621,6 +622,15 @@ html, body { height: 100%; font-family: 'Segoe UI', sans-serif; background: #0d1
       <label for="plan-eta-end">ETA window — to</label>
       <input type="date" id="plan-eta-end">
       <div class="modal-error" id="plan-error"></div>
+      {% if ai_enabled %}
+      <div id="plan-assessment-section" style="display:none; margin-top:10px; padding-top:10px; border-top:1px solid #30363d;">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+          <label style="margin:0;">Goby's assessment</label>
+          <button type="button" class="btn-mini" id="plan-assess-btn" onclick="assessCurrentDevicePlan()">🔍 Assess now</button>
+        </div>
+        <div id="plan-assessment-text" style="color:#c9d1d9; font-size:.8rem; background:#0d1117; border:1px solid #30363d; border-radius:6px; padding:8px 10px;"></div>
+      </div>
+      {% endif %}
     </div>
     <div id="plan-panel-actions" class="modal-actions">
       <button type="button" class="btn" id="plan-arrived-btn" onclick="markPlanArrived()" style="display:none;">Mark arrived</button>
@@ -1169,7 +1179,7 @@ function escapeHtml(s) {
 // (computed server-side in _visible_devices(), never the model — see
 // CLAUDE.md). null for a device with no plan, in which case no chip shows
 // at all, same as the private-device lock icon.
-const PLAN_STATUS_LABELS = { on_track: 'On track', overdue: '⚠ Overdue', moving_away: '⚠ Moving away' };
+const PLAN_STATUS_LABELS = { on_track: 'On track', overdue: '⚠ Overdue', moving_away: '⚠ Moving away', stalled: '⚠ Stalled' };
 function planStatusChipHtml(status) {
   if (!status || !PLAN_STATUS_LABELS[status]) return '';
   return `<span class="plan-chip ${status}" title="Smart Tracking plan status">${PLAN_STATUS_LABELS[status]}</span>`;
@@ -1178,7 +1188,7 @@ function planStatusChipHtml(status) {
 // Same colors as .plan-chip above (on_track omitted deliberately — a device
 // on track keeps its normal group color on the overview marker; only a
 // device that needs attention gets recolored to match its card's chip).
-const PLAN_STATUS_MARKER_COLORS = { overdue: '#f85149', moving_away: '#e3b341' };
+const PLAN_STATUS_MARKER_COLORS = { overdue: '#f85149', moving_away: '#e3b341', stalled: '#a371f7' };
 // cachedDevices (not allTracks — /api/tracks carries no plan_status) is the
 // only place plan_status lives client-side; looked up per marker rather than
 // stapled onto allTracks so there's one source of truth for it, same as the
@@ -1553,6 +1563,14 @@ async function openDevicePlan(uuid, name) {
   document.getElementById('plan-eta-end').value = plan?.eta_end ?? '';
   document.getElementById('plan-cancel-btn').style.display = plan ? '' : 'none';
   document.getElementById('plan-arrived-btn').style.display = plan ? '' : 'none';
+  // The assessment section only exists in the DOM at all when ai_enabled is
+  // true (Jinja-gated at render time) — checking for the element itself is
+  // the runtime guard, no separate JS flag needed.
+  const assessSection = document.getElementById('plan-assessment-section');
+  if (assessSection) {
+    assessSection.style.display = plan ? '' : 'none';
+    if (plan) loadPlanAssessment(uuid); else document.getElementById('plan-assessment-text').textContent = '';
+  }
   document.getElementById('plan-panel').classList.add('open');
 
   const defaultLat = plan?.dest_lat ?? map.getCenter().lat;
@@ -1611,6 +1629,46 @@ async function openDevicePlan(uuid, name) {
 
 function closePlanPanel() {
   document.getElementById('plan-panel').classList.remove('open');
+}
+
+// Scheduled plan monitoring (server-side, see _plan_monitor_loop() in
+// app.py) can already be generating assessments in the background — this
+// just shows the latest one. "Assess now" (below) is the per-device/per-plan
+// manual trigger, sharing the exact same backend function as the scheduled
+// job, so a manual and a scheduled assessment look identical once written.
+async function loadPlanAssessment(uuid) {
+  const textEl = document.getElementById('plan-assessment-text');
+  if (!textEl) return;
+  textEl.textContent = 'Loading…';
+  try {
+    const rows = await apiFetch(`/api/devices/${uuid}/plan/assessments?limit=1`).then(r => r.json());
+    if (rows && rows.length) {
+      const a = rows[0];
+      textEl.textContent = `${a.assessment_text} — ${a.created_at} UTC, status at the time: ${a.status_at_assessment}`;
+    } else {
+      textEl.textContent = 'No assessment yet — click "Assess now", or wait for the next scheduled check.';
+    }
+  } catch (e) {
+    textEl.textContent = 'Could not load the latest assessment.';
+  }
+}
+
+async function assessCurrentDevicePlan() {
+  if (!currentPlanUuid) return;
+  const btn = document.getElementById('plan-assess-btn');
+  const textEl = document.getElementById('plan-assessment-text');
+  btn.disabled = true;
+  textEl.textContent = 'Asking Goby…';
+  try {
+    const resp = await apiFetch(`/api/devices/${currentPlanUuid}/plan/assess`, { method: 'POST' });
+    const body = await resp.json();
+    if (!resp.ok) throw new Error(body.error || 'Failed to get an assessment');
+    textEl.textContent = `${body.assessment_text} — ${body.created_at} UTC, status at the time: ${body.status_at_assessment}`;
+  } catch (e) {
+    textEl.textContent = e.message || 'Could not get an assessment — try again.';
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 // ALL fields required, client AND server side — a plan with a missing ETA
@@ -1827,8 +1885,10 @@ document.addEventListener('click', (e) => {
   if (menu.classList.contains('open') && !menu.contains(e.target)) closeAlertsMenu();
 });
 
+const PLAN_ALERT_SORT_ORDER = { overdue: 0, moving_away: 1, stalled: 2 };
+
 function renderAlertsMenu(devices) {
-  const alerting = (devices || []).filter(d => d.plan_status === 'overdue' || d.plan_status === 'moving_away');
+  const alerting = (devices || []).filter(d => d.plan_status in PLAN_ALERT_SORT_ORDER);
   const badge = document.getElementById('alerts-badge');
   if (alerting.length) {
     badge.textContent = alerting.length > 99 ? '99+' : String(alerting.length);
@@ -1841,9 +1901,9 @@ function renderAlertsMenu(devices) {
     list.innerHTML = '<div id="alerts-empty">No active plan alerts</div>';
     return;
   }
-  // Overdue first — it's the more directly actionable signal, same priority
-  // order _compute_plan_status() itself uses when a device is somehow both.
-  const sorted = [...alerting].sort((a, b) => (a.plan_status === 'overdue' ? -1 : 1) - (b.plan_status === 'overdue' ? -1 : 1));
+  // Overdue, then moving_away, then stalled — same priority order
+  // _compute_plan_status() itself uses when a device is somehow more than one at once.
+  const sorted = [...alerting].sort((a, b) => PLAN_ALERT_SORT_ORDER[a.plan_status] - PLAN_ALERT_SORT_ORDER[b.plan_status]);
   list.innerHTML = sorted.map(d => `
     <div class="alert-row" onclick="closeAlertsMenu(); selectDevice('${d.uuid}');">
       <span>${escapeHtml(d.name)}</span>
@@ -2047,7 +2107,7 @@ function openAiGuide() {
     <table class="guide-table">
       <tr><th>Tool</th><th>What it tells you</th><th>Try asking</th></tr>
       <tr><td>List devices</td><td>A full overview — group, activity, signal quality, speed, distance traveled, and plan status for every device at once</td><td>"List every device I can see."</td></tr>
-      <tr><td>Plan alerts</td><td>Just the devices that need attention right now (overdue or drifting from their destination)</td><td>"Which devices need attention right now?"</td></tr>
+      <tr><td>Plan alerts</td><td>Just the devices that need attention right now — overdue, drifting from their destination, or stalled (no real progress in a few days)</td><td>"Which devices need attention right now?"</td></tr>
       <tr><td>Group devices</td><td>Everything in one named group</td><td>"How many devices are in &lt;group&gt;?"</td></tr>
       <tr><td>Find devices near a place</td><td>Which devices are near a city, or how far one is from it</td><td>"Which devices are near &lt;place&gt;?"</td></tr>
       <tr><td>Search labels</td><td>Search the notes people have added to devices</td><td>"What label is on &lt;device&gt;?"</td></tr>
@@ -2059,7 +2119,7 @@ function openAiGuide() {
       <tr><td>Device status</td><td>The full picture for one device — activity, signal quality, speed, location, current plan</td><td>"Give me a status update on &lt;device&gt;."</td></tr>
       <tr><td>Compute distance</td><td>How far it traveled, how fast, and where it stopped, over any date range</td><td>"How far did &lt;device&gt; travel last week?"</td></tr>
       <tr><td>Reporting gaps</td><td>Its biggest stretches of silence, historically</td><td>"What's &lt;device&gt;'s longest reporting gap?"</td></tr>
-      <tr><td>Plan status</td><td>Its current destination, ETA, and whether it's on track</td><td>"Is &lt;device&gt; on track?"</td></tr>
+      <tr><td>Plan status</td><td>Its current destination, ETA, whether it's on track/overdue/moving away/stalled, the required average speed to still make the ETA, and Goby's latest generated assessment if one exists</td><td>"Is &lt;device&gt; on track? Will it arrive on time?"</td></tr>
       <tr><td>Plan history</td><td>Its past plans — including whether each one was completed or cancelled</td><td>"Show me &lt;device&gt;'s plan history."</td></tr>
       <tr><td>Country history</td><td>Which countries it's been in over time</td><td>"Has &lt;device&gt; left the country recently?"</td></tr>
     </table>
