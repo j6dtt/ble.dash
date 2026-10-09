@@ -128,7 +128,7 @@ SCHEMA_VERSION = 15
 # into app_settings every startup, with a change logged to audit_log (not
 # just overwritten silently) so Management's Activity Log shows a real
 # history of what version was running when.
-APP_VERSION = "4.8"
+APP_VERSION = "4.9"
 
 
 def _load_or_create_secret_key() -> str:
@@ -323,6 +323,18 @@ _PROGRESS_TREND_THRESHOLD_MILES = 50
 # _PROGRESS_TREND_THRESHOLD_MILES above.
 _STALL_MIN_DAYS_SINCE_PROGRESS = 2
 _STALL_PROGRESS_FLOOR_MILES = 5
+# A flat mile floor doesn't scale: confirmed live on a real 1,500-mile plan
+# (device 1UJ0P0, Florida -> Venezuela) where ordinary GPS/city-driving noise
+# over a couple hundred fixes produced 7.2 miles of apparent "improvement"
+# with zero real progress toward the destination — comfortably clearing the
+# flat 5-mile floor and keeping a plan that was actually stalled (required
+# speed 68mph, actual speed 13.5mph, ETA window already past) reported as
+# on_track. The floor is now whichever is LARGER: the flat mile amount above
+# (still governs short-range plans, where 2% would be meaninglessly small),
+# or this percentage of the current distance-to-destination (dominates on
+# long-range plans, where a flat mile count is noise-scale) — see its use in
+# _compute_plan_status().
+_STALL_PROGRESS_FLOOR_PERCENT = 0.02
 
 
 def _compute_plan_status(uuid: str, plan_row, current_lat=None, current_lon=None) -> dict:
@@ -398,7 +410,13 @@ def _compute_plan_status(uuid: str, plan_row, current_lat=None, current_lon=None
             earliest_closest_miles = min(
                 _haversine_meters(r[0], r[1], dest_lat, dest_lon) / _METERS_PER_MILE for r in early_rows
             )
-            is_stalled = closest_approach_miles >= earliest_closest_miles - _STALL_PROGRESS_FLOOR_MILES
+            # Floor scales with distance — see _STALL_PROGRESS_FLOOR_PERCENT's
+            # comment: a flat mile count is noise-scale on a long-range plan
+            # (confirmed live: 7.2mi of pure GPS/driving noise on a 1,500mi
+            # trip cleared a flat 5mi floor), so the floor is whichever is
+            # larger, the flat amount or this percentage of the distance.
+            stall_floor_miles = max(_STALL_PROGRESS_FLOOR_MILES, closest_approach_miles * _STALL_PROGRESS_FLOOR_PERCENT)
+            is_stalled = closest_approach_miles >= earliest_closest_miles - stall_floor_miles
 
     required_avg_speed_mph = None
     eta_end_date = None
@@ -2136,18 +2154,29 @@ def _plan_monitor_cycle():
     burn LLM calls re-stating the same thing. on_track plans are never
     assessed. Each LLM call runs through _AI_SEMAPHORE like any other, and
     serially (one device at a time, never concurrent) so this background
-    job can never compete with live chat/SSE traffic for threads."""
+    job can never compete with live chat/SSE traffic for threads.
+
+    Logs one INFO heartbeat line per cycle — a fully-correct cycle that
+    finds nothing to do (no transitions, nothing past its cooldown)
+    otherwise produces ZERO log output, which is indistinguishable from the
+    thread having silently died. Confirmed live: 20+ hours of correct,
+    quiet no-op cycles looked identical to "not running" from the outside
+    until the raw plan_assessments/device_plans timestamps were checked by
+    hand — this makes that visible without digging into the DB."""
     if not _plan_monitor_enabled():
+        logging.info("Plan monitor: disabled (plan_monitor_enabled off, or Ask Goby itself is off) — skipping this cycle")
         return
     with sqlite3.connect(DB_PATH) as con:
         con.row_factory = sqlite3.Row
         plans = con.execute("SELECT * FROM device_plans").fetchall()
+    assessed = skipped = failed = 0
     for plan in plans:
         uuid = plan["uuid"]
         try:
             status = _compute_plan_status(uuid, plan)["status"]
         except Exception:
             logging.exception("Plan monitor: status computation failed for %s", uuid)
+            failed += 1
             continue
         needs_assessment = False
         if status != "on_track":
@@ -2184,7 +2213,12 @@ def _plan_monitor_cycle():
             # retries, rather than the row silently recording this cycle as
             # "handled" when it wasn't (which could otherwise hide a real
             # failure for up to PLAN_MONITOR_REASSESS_HOURS).
+            failed += 1
             continue
+        if needs_assessment:
+            assessed += 1
+        else:
+            skipped += 1
         with sqlite3.connect(DB_PATH) as con:
             con.execute(
                 "UPDATE device_plans SET last_monitored_status = ?, "
@@ -2193,6 +2227,10 @@ def _plan_monitor_cycle():
                 (status, 1 if needs_assessment else 0, uuid),
             )
             con.commit()
+    logging.info(
+        "Plan monitor: checked %d plan(s) — %d assessed, %d skipped (no change/within cooldown), %d failed",
+        len(plans), assessed, skipped, failed,
+    )
 
 
 def _plan_monitor_loop():

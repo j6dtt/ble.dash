@@ -52,7 +52,7 @@ html, body { height: 100%; font-family: 'Segoe UI', sans-serif; background: #0d1
   display: flex; align-items: center; justify-content: center; line-height: 1;
 }
 #alerts-dropdown {
-  position: absolute; top: calc(100% + 8px); right: 0; width: 280px; max-height: 360px; z-index: 900;
+  position: absolute; top: calc(100% + 8px); right: 0; width: 340px; max-height: 420px; z-index: 900;
   background: #161b22; border: 1px solid #30363d; border-radius: 8px;
   box-shadow: 0 8px 24px rgba(0,0,0,.5); overflow-y: auto; display: none;
 }
@@ -62,13 +62,34 @@ html, body { height: 100%; font-family: 'Segoe UI', sans-serif; background: #0d1
   font-size: .72rem; font-weight: 700; text-transform: uppercase; letter-spacing: .5px; color: #8b949e;
   position: sticky; top: 0; background: #161b22;
 }
+/* "New" (unseen since the bell was last opened) vs. "Known issues" (already
+   seen, status unchanged) — a plain filtered list of current status would
+   just repeat the device card's own chip; this distinguishes WHAT CHANGED,
+   which the chip can't. */
+.alert-section-label {
+  padding: 6px 14px; font-size: .62rem; font-weight: 700; text-transform: uppercase;
+  letter-spacing: .5px; color: #8b949e; background: #0d1117;
+}
 .alert-row {
-  display: flex; align-items: center; gap: 8px; padding: 10px 14px; cursor: pointer;
+  display: flex; flex-direction: column; gap: 4px; padding: 10px 14px; cursor: pointer;
   border-bottom: 1px solid #21262d; font-size: .8rem; color: #c9d1d9;
 }
 .alert-row:last-child { border-bottom: none; }
 .alert-row:hover { background: #21262d; }
+.alert-row-top { display: flex; align-items: center; gap: 8px; }
+.alert-row-top > span:first-child { display: flex; align-items: center; gap: 6px; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .alert-row .plan-chip { flex-shrink: 0; }
+.alert-new-dot { flex-shrink: 0; width: 6px; height: 6px; border-radius: 50%; background: #58a6ff; }
+/* Goby's own narration for WHY the plan looks bad — the thing a bare status
+   chip can never carry, since it's only a label, not an explanation. */
+.alert-snippet {
+  font-size: .72rem; color: #8b949e; line-height: 1.35; cursor: pointer;
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden;
+}
+.alert-snippet:hover { color: #c9d1d9; }
+.alert-snippet.expanded { -webkit-line-clamp: unset; line-clamp: unset; display: block; overflow: visible; }
+.alert-snippet.loading { font-style: italic; cursor: default; }
+.alert-snippet.loading:hover { color: #8b949e; }
 #alerts-empty { padding: 16px 14px; font-size: .78rem; color: #8b949e; text-align: center; }
 #user-menu { position: relative; }
 #user-menu-btn {
@@ -112,6 +133,20 @@ html, body { height: 100%; font-family: 'Segoe UI', sans-serif; background: #0d1
 
 /* Attribution moved to top-right, away from the detail bar */
 .leaflet-bottom.leaflet-right { bottom: auto; top: 0; }
+
+/* Lifted clear of #detailbar's height (shown only when drilled into a
+   device) rather than made aware of its visibility — simpler than toggling
+   position/z-index per view, and leaves a small, deliberate gap above the
+   very bottom edge in the overview too. */
+#map-clock {
+  position: absolute; bottom: 64px; left: 12px; z-index: 850; text-align: center;
+  background: rgba(13, 17, 23, .9); border: 1px solid #30363d; border-radius: 8px;
+  box-shadow: 0 4px 14px rgba(0,0,0,.45);
+  padding: 8px 18px; color: #e6edf3; font-family: 'Consolas', monospace; pointer-events: none;
+}
+#map-clock-date { font-size: .8rem; font-weight: 600; color: #c9d1d9; letter-spacing: .6px; }
+#map-clock-time { font-size: 1.6rem; font-weight: 700; letter-spacing: 1px; line-height: 1.3; }
+#map-clock-time span { color: #8b949e; font-size: .72rem; font-weight: 700; margin-left: 7px; letter-spacing: .6px; }
 
 /* ── Detail bar (shown only while a device is drilled into) ───────── */
 #detailbar {
@@ -535,6 +570,10 @@ html, body { height: 100%; font-family: 'Segoe UI', sans-serif; background: #0d1
 
 <div id="main">
   <div id="map">
+    <div id="map-clock">
+      <div id="map-clock-date"></div>
+      <div id="map-clock-time"></div>
+    </div>
     <div id="detailbar">
       <span id="detail-name"></span>
       <div id="window-control">
@@ -737,6 +776,26 @@ L.Control.BoxZoomHint = L.Control.extend({
   }
 });
 new L.Control.BoxZoomHint().addTo(map);
+
+// Shown in UTC, not local/browser time — every other timestamp in this app
+// (obs_time, plan ETAs, Goby assessments) is already stated in UTC, so a
+// local-time clock would be a second, inconsistent time standard on the
+// same screen.
+function _tickMapClock() {
+  const now = new Date();
+  const yyyy = now.getUTCFullYear();
+  const mo = String(now.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(now.getUTCDate()).padStart(2, '0');
+  const hh = String(now.getUTCHours()).padStart(2, '0');
+  const mm = String(now.getUTCMinutes()).padStart(2, '0');
+  const ss = String(now.getUTCSeconds()).padStart(2, '0');
+  // YYYY-MM-DD — same format every date already shown elsewhere in this app
+  // (plan start_date/eta_start/eta_end) uses, not a locale-dependent one.
+  document.getElementById('map-clock-date').textContent = `${yyyy}-${mo}-${dd}`;
+  document.getElementById('map-clock-time').innerHTML = `${hh}:${mm}:${ss}<span>UTC</span>`;
+}
+_tickMapClock();
+setInterval(_tickMapClock, 1000);
 
 // ── State ─────────────────────────────────────────────────────────
 // Devices are colored by group, not individually. An admin can set an
@@ -1868,16 +1927,61 @@ document.addEventListener('click', (e) => {
 
 // Smart Tracking stage 3 — purely a client-side view over d.plan_status,
 // already present in every /api/devices response (same field the device-
-// card chip reads). No new endpoint; renderAlertsMenu() is called from
-// renderPanel() on every refresh (SSE push or the existing 30s poll), so
-// this updates live with zero new plumbing, same as the chip itself.
+// card chip reads). No new endpoint for status itself; renderAlertsMenu()
+// is called from renderPanel() on every refresh (SSE push or the existing
+// 30s poll), so the badge/new-vs-known split stays live with zero new
+// plumbing for that part.
+//
+// A plain filtered list of current status would just repeat the device
+// card's own chip (the exact redundancy this was reworked to fix) — so the
+// bell now tracks two things the chip can't: WHAT'S NEW (per-viewer, via
+// localStorage, same pattern this app already uses for hiddenDevices/
+// expandedGroups rather than a server-side table) and WHY (Goby's own
+// latest plan_assessments text, fetched lazily only when the dropdown is
+// actually opened — never on every poll, to keep the existing zero-cost-
+// per-poll design for the badge itself).
+const PLAN_ALERT_SORT_ORDER = { overdue: 0, moving_away: 1, stalled: 2 };
+let currentAlerts = [];              // this poll's alerting devices, cached so the dropdown can re-render without re-fetching /api/devices
+const alertAssessmentCache = {};     // uuid -> { status, text } — only populated once the dropdown has actually been opened for that uuid's CURRENT status
+const expandedAlertSnippets = new Set();   // uuids currently showing the FULL assessment text rather than the 2-line clamp
+
+function _loadAlertsSeen() {
+  try { return JSON.parse(localStorage.getItem('planAlertsSeen') || '{}'); } catch (e) { return {}; }
+}
+function _saveAlertsSeen(seen) {
+  try { localStorage.setItem('planAlertsSeen', JSON.stringify(seen)); } catch (e) {}
+}
+
+// Toggles one alert's snippet between a 2-line clamp and the full assessment
+// text — stopPropagation so clicking the snippet doesn't also fire the
+// row's own onclick (which navigates to the device via selectDevice()).
+function toggleAlertSnippet(uuid, evt) {
+  evt.stopPropagation();
+  if (expandedAlertSnippets.has(uuid)) expandedAlertSnippets.delete(uuid);
+  else expandedAlertSnippets.add(uuid);
+  renderAlertsList();
+}
+
 function toggleAlertsMenu(evt) {
   evt?.stopPropagation();
-  document.getElementById('alerts-menu').classList.toggle('open');
+  const menu = document.getElementById('alerts-menu');
+  const opening = !menu.classList.contains('open');
+  menu.classList.toggle('open');
+  if (opening) loadAlertAssessments();   // lazy — only fetched when a human actually looks, never on a background poll
 }
 
 function closeAlertsMenu() {
-  document.getElementById('alerts-menu').classList.remove('open');
+  const menu = document.getElementById('alerts-menu');
+  if (!menu.classList.contains('open')) return;
+  menu.classList.remove('open');
+  // Mark everything that was showing as "seen" at the moment of closing, not
+  // opening — so while the dropdown is open, rows stay flagged "New" and
+  // don't shift out from under the viewer; only the NEXT open treats them
+  // as already-known.
+  const seen = _loadAlertsSeen();
+  currentAlerts.forEach(d => { seen[d.uuid] = d.plan_status; });
+  _saveAlertsSeen(seen);
+  renderAlertsMenu(cachedDevices);   // cheap, no fetch — just recompute the badge now that seen[] changed
 }
 
 document.addEventListener('click', (e) => {
@@ -1885,31 +1989,86 @@ document.addEventListener('click', (e) => {
   if (menu.classList.contains('open') && !menu.contains(e.target)) closeAlertsMenu();
 });
 
-const PLAN_ALERT_SORT_ORDER = { overdue: 0, moving_away: 1, stalled: 2 };
-
 function renderAlertsMenu(devices) {
-  const alerting = (devices || []).filter(d => d.plan_status in PLAN_ALERT_SORT_ORDER);
+  currentAlerts = (devices || []).filter(d => d.plan_status in PLAN_ALERT_SORT_ORDER);
+  const seen = _loadAlertsSeen();
+  const newCount = currentAlerts.filter(d => seen[d.uuid] !== d.plan_status).length;
   const badge = document.getElementById('alerts-badge');
-  if (alerting.length) {
-    badge.textContent = alerting.length > 99 ? '99+' : String(alerting.length);
+  if (newCount) {
+    badge.textContent = newCount > 99 ? '99+' : String(newCount);
     badge.style.display = 'flex';
   } else {
     badge.style.display = 'none';
   }
+  renderAlertsList();
+}
+
+function renderAlertsList() {
   const list = document.getElementById('alerts-list');
-  if (!alerting.length) {
+  if (!currentAlerts.length) {
     list.innerHTML = '<div id="alerts-empty">No active plan alerts</div>';
     return;
   }
+  const seen = _loadAlertsSeen();
   // Overdue, then moving_away, then stalled — same priority order
   // _compute_plan_status() itself uses when a device is somehow more than one at once.
-  const sorted = [...alerting].sort((a, b) => PLAN_ALERT_SORT_ORDER[a.plan_status] - PLAN_ALERT_SORT_ORDER[b.plan_status]);
-  list.innerHTML = sorted.map(d => `
-    <div class="alert-row" onclick="closeAlertsMenu(); selectDevice('${d.uuid}');">
-      <span>${escapeHtml(d.name)}</span>
-      ${planStatusChipHtml(d.plan_status)}
-    </div>
-  `).join('');
+  const sorted = [...currentAlerts].sort((a, b) => PLAN_ALERT_SORT_ORDER[a.plan_status] - PLAN_ALERT_SORT_ORDER[b.plan_status]);
+  const newAlerts = sorted.filter(d => seen[d.uuid] !== d.plan_status);
+  const knownAlerts = sorted.filter(d => seen[d.uuid] === d.plan_status);
+
+  const rowHtml = (d, isNew) => {
+    const cached = alertAssessmentCache[d.uuid];
+    let snippet = '';
+    if (cached && cached.status === d.plan_status) {
+      const expanded = expandedAlertSnippets.has(d.uuid);
+      snippet = `<div class="alert-snippet${expanded ? ' expanded' : ''}" onclick="toggleAlertSnippet('${d.uuid}', event)" title="Click to ${expanded ? 'collapse' : 'show full assessment'}">${escapeHtml(cached.text)}</div>`;
+    } else if (document.getElementById('alerts-menu').classList.contains('open')) {
+      snippet = `<div class="alert-snippet loading">Loading Goby's assessment…</div>`;
+    }
+    return `
+      <div class="alert-row" onclick="closeAlertsMenu(); selectDevice('${d.uuid}');">
+        <div class="alert-row-top">
+          <span>${isNew ? '<span class="alert-new-dot" title="New since you last checked"></span>' : ''}${escapeHtml(d.name)}</span>
+          ${planStatusChipHtml(d.plan_status)}
+        </div>
+        ${snippet}
+      </div>`;
+  };
+
+  let html = '';
+  if (newAlerts.length) html += '<div class="alert-section-label">New</div>' + newAlerts.map(d => rowHtml(d, true)).join('');
+  if (knownAlerts.length) html += '<div class="alert-section-label">Known issues</div>' + knownAlerts.map(d => rowHtml(d, false)).join('');
+  list.innerHTML = html;
+}
+
+// Fetches Goby's latest assessment for each currently-alerting device — only
+// called when the dropdown is actually opened (toggleAlertsMenu), never on
+// a background poll, and skips anything already cached for its CURRENT
+// status (a status change invalidates the cached text, since it's for a
+// different incident). Runs in parallel; each result re-renders the list
+// as it lands rather than waiting for every fetch to finish.
+async function loadAlertAssessments() {
+  const targets = currentAlerts.filter(d => {
+    const cached = alertAssessmentCache[d.uuid];
+    return !cached || cached.status !== d.plan_status;
+  });
+  if (!targets.length) return;
+  // A stale status's expand state shouldn't carry over to the new one it's
+  // about to be replaced with — each status's assessment starts collapsed.
+  targets.forEach(d => expandedAlertSnippets.delete(d.uuid));
+  renderAlertsList();   // show "Loading…" placeholders immediately
+  await Promise.all(targets.map(async (d) => {
+    try {
+      const rows = await apiFetch(`/api/devices/${d.uuid}/plan/assessments?limit=1`).then(r => r.json());
+      alertAssessmentCache[d.uuid] = {
+        status: d.plan_status,
+        text: (rows && rows.length) ? rows[0].assessment_text : 'No assessment yet for this status.',
+      };
+    } catch (e) {
+      // Leave uncached — that row just shows no snippet this time, not an error state.
+    }
+    renderAlertsList();
+  }));
 }
 
 document.addEventListener('keydown', (e) => {
